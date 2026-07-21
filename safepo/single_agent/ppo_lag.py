@@ -101,7 +101,9 @@ def main(args, cfg_env=None):
         act_dim=act_space.shape[0],
         hidden_sizes=config["hidden_sizes"],
     ).to(device)
-    actor_optimizer = torch.optim.Adam(policy.actor.parameters(), lr=3e-4)
+    actor_lr = float(getattr(args, "actor_lr", 3e-4))
+    critic_lr = float(getattr(args, "critic_lr", 3e-4))
+    actor_optimizer = torch.optim.Adam(policy.actor.parameters(), lr=actor_lr)
     actor_scheduler = LinearLR(
         actor_optimizer,
         start_factor=1.0,
@@ -110,10 +112,10 @@ def main(args, cfg_env=None):
         verbose=False,
     )
     reward_critic_optimizer = torch.optim.Adam(
-        policy.reward_critic.parameters(), lr=3e-4
+        policy.reward_critic.parameters(), lr=critic_lr
     )
     cost_critic_optimizer = torch.optim.Adam(
-        policy.cost_critic.parameters(), lr=3e-4
+        policy.cost_critic.parameters(), lr=critic_lr
     )
 
     # create the vectorized on-policy buffer
@@ -124,6 +126,8 @@ def main(args, cfg_env=None):
         device=device,
         num_envs=args.num_envs,
         gamma=config["gamma"],
+        lam=float(getattr(args, "lam", 0.95)),
+        lam_c=float(getattr(args, "lam_c", 0.95)),
     )
     # setup lagrangian multiplier
     lagrange = Lagrange(
@@ -315,7 +319,8 @@ def main(args, cfg_env=None):
                 distribution = policy.actor(obs_b)
                 log_prob = distribution.log_prob(act_b).sum(dim=-1)
                 ratio = torch.exp(log_prob - log_prob_b)
-                ratio_cliped = torch.clamp(ratio, 0.8, 1.2)
+                clip = float(getattr(args, "clip_ratio", 0.2))
+                ratio_cliped = torch.clamp(ratio, 1.0 - clip, 1.0 + clip)
                 loss_pi = -torch.min(ratio * adv_b, ratio_cliped * adv_b).mean()
                 actor_optimizer.zero_grad()
                 total_loss = loss_pi + 2*loss_r + loss_c \

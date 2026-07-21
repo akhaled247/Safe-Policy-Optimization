@@ -196,11 +196,13 @@ def main(args, cfg_env=None):
         act_dim=act_space.shape[0],
         hidden_sizes=config["hidden_sizes"],
     ).to(device)
+    critic_lr = float(getattr(args, "critic_lr", 3e-4))
+
     reward_critic_optimizer = torch.optim.Adam(
-        policy.reward_critic.parameters(), lr=1e-3
+        policy.reward_critic.parameters(), lr=critic_lr
     )
     cost_critic_optimizer = torch.optim.Adam(
-        policy.cost_critic.parameters(), lr=1e-3
+        policy.cost_critic.parameters(), lr=critic_lr
     )
 
     # create the vectorized on-policy buffer
@@ -211,6 +213,8 @@ def main(args, cfg_env=None):
         device=device,
         num_envs=args.num_envs,
         gamma=config["gamma"],
+        lam=float(getattr(args, "lam", 0.95)),
+        lam_c=float(getattr(args, "lam_c", 0.95)),
     )
     # setup lagrangian multiplier
     lagrange = Lagrange(
