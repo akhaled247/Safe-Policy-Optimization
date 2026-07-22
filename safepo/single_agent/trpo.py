@@ -519,7 +519,8 @@ def main(args, cfg_env=None):
             logger.log_tabular("Misc/AcceptanceStep")
 
             logger.dump_tabular()
-            if (epoch+1) % 100 == 0 or epoch == 0:
+            save_freq = int(getattr(args, "save_model_freq", 10))  # epochs
+            if epoch == 0 or epoch == epochs - 1 or (epoch + 1) % save_freq == 0:
                 logger.torch_save(itr=epoch)
                 if args.task not in isaac_gym_map.keys():
                     logger.save_state(
@@ -528,6 +529,15 @@ def main(args, cfg_env=None):
                         },
                         itr = epoch
                     )
+    # Belt-and-suspenders: always write final epoch after the training loop
+    last_epoch = epochs - 1
+    if last_epoch >= 0:
+        logger.torch_save(itr=last_epoch)
+        if args.task not in isaac_gym_map.keys():
+            logger.save_state(
+                state_dict={"Normalizer": env.obs_rms},
+                itr=last_epoch,
+            )
     logger.close()
 
 
