@@ -319,14 +319,20 @@ def main(args, cfg_env=None):
                         loss_c += param.pow(2).sum() * 0.001
                 distribution = policy.actor(obs_b)
                 log_prob = distribution.log_prob(act_b).sum(dim=-1)
+                # Sum over action dims to match log_prob; Normal.entropy() is per-dim.
+                entropy = distribution.entropy().sum(dim=-1).mean()
+                ent_coef = float(getattr(args, "ent_coef", 0.0))
                 ratio = torch.exp(log_prob - log_prob_b)
                 clip = float(getattr(args, "clip_ratio", 0.2))
                 ratio_cliped = torch.clamp(ratio, 1.0 - clip, 1.0 + clip)
                 loss_pi = -torch.min(ratio * adv_b, ratio_cliped * adv_b).mean()
+                loss_pi = loss_pi - ent_coef * entropy  # maximize H when minimizing loss
                 actor_optimizer.zero_grad()
-                total_loss = loss_pi + 2*loss_r + loss_c \
-                    if config.get("use_value_coefficient", False) \
+                total_loss = (
+                    loss_pi + 2 * loss_r + loss_c
+                    if config.get("use_value_coefficient", False)
                     else loss_pi + loss_r + loss_c
+                )
                 total_loss.backward()
                 clip_grad_norm_(policy.parameters(), config["max_grad_norm"])
                 reward_critic_optimizer.step()
@@ -338,6 +344,7 @@ def main(args, cfg_env=None):
                         "Loss/Loss_reward_critic": loss_r.mean().item(),
                         "Loss/Loss_cost_critic": loss_c.mean().item(),
                         "Loss/Loss_actor": loss_pi.mean().item(),
+                        "Misc/Entropy": entropy.item(),
                     }
                 )
 
