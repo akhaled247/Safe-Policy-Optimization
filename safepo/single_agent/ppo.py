@@ -103,11 +103,12 @@ def main(args, cfg_env=None):
     actor_lr = float(getattr(args, "actor_lr", 3e-4))
     critic_lr = float(getattr(args, "critic_lr", 3e-4))
     actor_optimizer = torch.optim.Adam(policy.actor.parameters(), lr=actor_lr)
+    end_factor = float(getattr(args, "lr_end_factor", 1.0))  # Default to no lr_end_factor
     actor_scheduler = LinearLR(
         actor_optimizer,
         start_factor=1.0,
-        end_factor=0.0,
-        total_iters=epochs,
+        end_factor=end_factor,
+        total_iters=max(epochs, 1),
         verbose=False,
     )
     reward_critic_optimizer = torch.optim.Adam(
