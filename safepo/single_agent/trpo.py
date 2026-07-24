@@ -369,7 +369,9 @@ def main(args, cfg_env=None):
         temp_distribution = policy.actor(data["obs"])
         log_prob = temp_distribution.log_prob(data["act"]).sum(dim=-1)
         ratio = torch.exp(log_prob - data["log_prob"])
-        loss_pi = -(ratio * advantage).mean()
+        ent_coef = float(getattr(args, "ent_coef", 0.0))
+        entropy = temp_distribution.entropy().sum(dim=-1).mean()
+        loss_pi = -(ratio * advantage).mean() - ent_coef * entropy
         loss_before = loss_pi.item()
         old_distribution = policy.actor(data["obs"])
 
@@ -401,7 +403,8 @@ def main(args, cfg_env=None):
                 temp_distribution = policy.actor(data["obs"])
                 log_prob = temp_distribution.log_prob(data["act"]).sum(dim=-1)
                 ratio = torch.exp(log_prob - data["log_prob"])
-                loss_pi = -(ratio * advantage).mean()
+                entropy = temp_distribution.entropy().sum(dim=-1).mean()
+                loss_pi = -(ratio * advantage).mean() - ent_coef * entropy
                 # compute KL distance between new and old policy
                 current_distribution = policy.actor(data["obs"])
                 kl = (
@@ -446,6 +449,7 @@ def main(args, cfg_env=None):
                 "Misc/H_inv_g": x.norm().item(),
                 "Misc/AcceptanceStep": acceptance_step,
                 "Loss/Loss_actor": loss_pi.mean().item(),
+                "Misc/Entropy": entropy.item(),
                 "Train/KL": final_kl,
             },
         )
