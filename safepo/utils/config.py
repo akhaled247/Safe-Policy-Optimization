@@ -68,6 +68,19 @@ multi_agent_goal_tasks = [
     "SafetyAntMultiGoal0-v0",
     "SafetyAntMultiGoal1-v0",
     "SafetyAntMultiGoal2-v0",
+    # SpecRLBench Point MASAR2 (± WC / AC)
+    "PointLTL0MASAR2-v0",
+    "PointLTL1MASAR2-v0",
+    "PointLTL2MASAR2-v0",
+    "PointLTL3MASAR2-v0",
+    "PointLTL0MASAR2WC-v0",
+    "PointLTL1MASAR2WC-v0",
+    "PointLTL2MASAR2WC-v0",
+    "PointLTL3MASAR2WC-v0",
+    "PointLTL0MASAR2AC-v0",
+    "PointLTL1MASAR2AC-v0",
+    "PointLTL2MASAR2AC-v0",
+    "PointLTL3MASAR2AC-v0",
 ]
 
 isaac_gym_map = {
