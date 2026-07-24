@@ -16,8 +16,14 @@
 
 from __future__ import annotations
 
+import sys
+
+from safepo.common.farama_filter import silence_farama_adroit_spam
+
+# Spawn workers re-import this module; silence before safety_gymnasium import.
+silence_farama_adroit_spam()
+
 from abc import ABC, abstractmethod
-from multiprocessing import Pipe, Process
 
 from typing import Any
 import torch
@@ -398,6 +404,9 @@ def shareworker(remote, parent_remote, env_fn_wrapper):
     while True:
         cmd, data = remote.recv()
         if cmd == 'step':
+            # IPC payloads are CPU tensors/numpy — never CUDA across processes.
+            if torch.is_tensor(data):
+                data = data.detach().cpu()
             ob, s_ob, reward, cost, done, info, available_actions = env.step(data)
             if 'bool' in done.__class__.__name__:
                 if done:
@@ -434,15 +443,29 @@ def shareworker(remote, parent_remote, env_fn_wrapper):
             raise NotImplementedError
 
 
+def _ensure_spawn_start_method() -> None:
+    """Prefer spawn when start method still unset (CUDA + fork is unsafe)."""
+    import multiprocessing as mp
+
+    if mp.get_start_method(allow_none=True) is not None:
+        return
+    try:
+        mp.set_start_method("spawn")
+    except RuntimeError:
+        pass
+
+
 class ShareSubprocVecEnv(ShareVecEnv):
     def __init__(self, env_fns, device=torch.device("cpu")):
         self.waiting = False
         self.closed = False
         self.device = device
         nenvs = len(env_fns)
-        self.remotes, self.work_remotes = zip(*[Pipe() for _ in range(nenvs)])
+        _ensure_spawn_start_method()
+        ctx = torch.multiprocessing.get_context("spawn")
+        self.remotes, self.work_remotes = zip(*[ctx.Pipe() for _ in range(nenvs)])
         self.ps = [
-            Process(target=shareworker, args=(work_remote, remote, CloudpickleWrapper(env_fn)))
+            ctx.Process(target=shareworker, args=(work_remote, remote, CloudpickleWrapper(env_fn)))
             for (work_remote, remote, env_fn) in zip(self.work_remotes, self.remotes, env_fns)
         ]
         for p in self.ps:
@@ -460,6 +483,8 @@ class ShareSubprocVecEnv(ShareVecEnv):
 
     def step_async(self, actions):
         env_actions = torch.transpose(torch.stack(actions), 1, 0)
+        # Never pickle CUDA tensors into workers.
+        env_actions = env_actions.detach().cpu()
         for remote, action in zip(self.remotes, env_actions):
             remote.send(('step', action))
         self.waiting = True
@@ -497,7 +522,8 @@ class ShareDummyVecEnv(ShareVecEnv):
 
     def step_async(self, actions):
         env_actions = torch.transpose(torch.stack(actions), 1, 0)
-        self.actions = env_actions
+        # Keep actions on CPU for env.step (avoids accidental CUDA tensors).
+        self.actions = env_actions.detach().cpu()
 
     def step_wait(self):
         results = [env.step(a) for (a, env) in zip(self.actions, self.envs)]
