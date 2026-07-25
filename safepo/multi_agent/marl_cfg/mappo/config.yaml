@@ -1,13 +1,13 @@
 env_name: mappo
 algorithm_name: mappo
-experiment_name: check
+experiment_name: specrlbench
 seed: 0
 run_dir: ./runs
-num_env_steps: 100000000
-episode_length: 8
-n_rollout_threads: 80
+num_env_steps: 4000000
+episode_length: 2500
+n_rollout_threads: 8
 n_eval_rollout_threads: 1
-hidden_size: 512
+hidden_size: 64
 use_render: False
 recurrent_N: 1
 use_single_network: False
@@ -16,36 +16,36 @@ save_interval: 10
 use_eval: False
 eval_interval: 25
 log_interval: 25
-eval_episodes: 10000
+eval_episodes: 50
 
-gamma: 0.96
+gamma: 0.99
 gae_lambda: 0.95
 use_gae: True
 use_popart: True
 use_valuenorm: False
 use_proper_time_limits: False
 
-target_kl: 0.016
+target_kl: 0.05
 searching_steps: 10
 accept_ratio: 0.5
 clip_param: 0.2
-learning_iters: 5
+learning_iters: 10
 num_mini_batch: 1
-data_chunk_length: 
+data_chunk_length: 10
 value_loss_coef: 1
-entropy_coef: 0.0
-max_grad_norm: 10
+entropy_coef: 0.02
+max_grad_norm: 10.0
 huber_delta: 10.0
 use_recurrent_policy: False
 use_naive_recurrent_policy: False
 use_max_grad_norm: True
 use_clipped_value_loss: True
 use_huber_loss: True
-use_value_active_masks: False
-use_policy_active_masks: False
+use_value_active_masks: True
+use_policy_active_masks: True
 
-actor_lr: 9.e-5
-critic_lr: 5.e-3
+actor_lr: 5.e-5
+critic_lr: 1.e-3
 opti_eps: 1.e-5
 weight_decay: 0.0
 
@@ -61,14 +61,21 @@ layer_N: 2
 std_x_coef: 1
 std_y_coef: 0.5
 
-mamujoco: 
-  num_env_steps: 10000000
-  episode_length: 1000
-  n_rollout_threads: 10
-  n_eval_rollout_threads: 10
-  hidden_size: 128
+# Merged for PointLTL*MASAR2* (±WC/AC) via multi_agent_args — keep in sync with SpecRLBench MA_SPECRL_RECIPE_B
+mamujoco:
+  num_env_steps: 4000000
+  episode_length: 2500
+  n_rollout_threads: 8
+  n_eval_rollout_threads: 1
+  hidden_size: 64
   gamma: 0.99
-  entropy_coef: 0.01
+  gae_lambda: 0.95
+  entropy_coef: 0.02
+  learning_iters: 10
+  target_kl: 0.05
+  clip_param: 0.2
+  actor_lr: 5.e-5
+  critic_lr: 1.e-3
   max_grad_norm: 10.0
   use_value_active_masks: True
   use_policy_active_masks: True
