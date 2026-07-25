@@ -399,69 +399,20 @@ class ShareVecEnv(ABC):
 
 
 def shareworker(remote, parent_remote, env_fn_wrapper):
-    import os
-
-    # #region agent log
-    def _dbg(hyp, loc, msg, data=None):
-        import json
-        import time
-        from pathlib import Path
-
-        try:
-            log_path = Path(__file__).resolve().parents[3] / "debug-5d8186.log"
-            payload = {
-                "sessionId": "5d8186",
-                "hypothesisId": hyp,
-                "location": loc,
-                "message": msg,
-                "data": data or {},
-                "timestamp": int(time.time() * 1000),
-                "runId": "pre-fix",
-            }
-            with log_path.open("a", encoding="utf-8") as f:
-                f.write(json.dumps(payload) + "\n")
-        except Exception:
-            pass
-
-    # #endregion
-
     parent_remote.close()
-    _dbg("C", "wrappers.shareworker:start", "worker started", {"pid": os.getpid()})
     try:
         env = env_fn_wrapper.x()
-    except BaseException as exc:
+    except BaseException:
         import traceback
 
-        _dbg(
-            "A",
-            "wrappers.shareworker:init_fail",
-            "env_fn_wrapper.x() failed",
-            {"pid": os.getpid(), "error": repr(exc), "tb": traceback.format_exc()[-2000:]},
-        )
         try:
             remote.send(("init_error", traceback.format_exc()))
         except Exception:
             pass
         raise
-    _dbg(
-        "C",
-        "wrappers.shareworker:ready_send",
-        "env created, sending ready",
-        {"pid": os.getpid(), "num_agents": getattr(env, "num_agents", None)},
-    )
     remote.send(("ready", None))
     while True:
-        try:
-            cmd, data = remote.recv()
-        except EOFError:
-            _dbg(
-                "E",
-                "wrappers.shareworker:recv_eof",
-                "remote.recv EOF (parent closed pipe)",
-                {"pid": os.getpid()},
-            )
-            raise
-        _dbg("B", "wrappers.shareworker:cmd", "received command", {"pid": os.getpid(), "cmd": cmd})
+        cmd, data = remote.recv()
         if cmd == 'step':
             # IPC payloads are CPU tensors/numpy — never CUDA across processes.
             if torch.is_tensor(data):
@@ -478,7 +429,6 @@ def shareworker(remote, parent_remote, env_fn_wrapper):
         elif cmd == 'reset':
             ob, s_ob, available_actions = env.reset()
             remote.send((ob, s_ob, available_actions))
-            _dbg("F", "wrappers.shareworker:reset_sent", "reset response sent", {"pid": os.getpid()})
         elif cmd == 'reset_task':
             ob = env.reset_task()
             remote.send(ob)
@@ -541,61 +491,12 @@ def _stack_ma_scalar_batch(batch, device):
     return torch.tensor(arr, dtype=torch.float32, device=device)
 
 
-def _agent_dbg(hyp, loc, msg, data=None, run_id="post-fix"):
-    # #region agent log
-    import json
-    import time
-    from pathlib import Path
-
-    try:
-        log_path = Path(__file__).resolve().parents[3] / "debug-5d8186.log"
-        payload = {
-            "sessionId": "5d8186",
-            "hypothesisId": hyp,
-            "location": loc,
-            "message": msg,
-            "data": data or {},
-            "timestamp": int(time.time() * 1000),
-            "runId": run_id,
-        }
-        with log_path.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(payload) + "\n")
-    except Exception:
-        pass
-    # #endregion
-
 class ShareSubprocVecEnv(ShareVecEnv):
     def __init__(self, env_fns, device=torch.device("cpu")):
-        import json
-        import os
-        import time
-        from pathlib import Path
-
-        # #region agent log
-        def _parent_dbg(hyp, loc, msg, data=None):
-            try:
-                log_path = Path(__file__).resolve().parents[3] / "debug-5d8186.log"
-                payload = {
-                    "sessionId": "5d8186",
-                    "hypothesisId": hyp,
-                    "location": loc,
-                    "message": msg,
-                    "data": data or {},
-                    "timestamp": int(time.time() * 1000),
-                    "runId": "pre-fix",
-                }
-                with log_path.open("a", encoding="utf-8") as f:
-                    f.write(json.dumps(payload) + "\n")
-            except Exception:
-                pass
-
-        # #endregion
-
         self.waiting = False
         self.closed = False
         self.device = device
         nenvs = len(env_fns)
-        _parent_dbg("D", "wrappers.ShareSubprocVecEnv:init", "parent starting vec env", {"nenvs": nenvs, "device": str(device), "pid": os.getpid()})
         _ensure_spawn_start_method()
         ctx = torch.multiprocessing.get_context("spawn")
         self.remotes, self.work_remotes = zip(*[ctx.Pipe() for _ in range(nenvs)])
@@ -613,28 +514,21 @@ class ShareSubprocVecEnv(ShareVecEnv):
                 msg = remote.recv()
             except EOFError as exc:
                 exit_codes = [p.exitcode for p in self.ps]
-                _parent_dbg("C", "wrappers.ShareSubprocVecEnv:ready_eof", "EOF waiting for ready", {"worker_i": i, "exit_codes": exit_codes})
                 raise RuntimeError(
                     f"Subproc env worker {i} died during init (exit codes={exit_codes}). "
                     "Re-run with --num-envs 1 to surface the traceback, or check stderr."
                 ) from exc
-            _parent_dbg("C", "wrappers.ShareSubprocVecEnv:ready_ok", "worker ready received", {"worker_i": i, "msg_type": msg[0] if isinstance(msg, tuple) else type(msg).__name__})
             if isinstance(msg, tuple) and msg[0] == "init_error":
                 for p in self.ps:
                     p.join(timeout=1)
-                _parent_dbg("A", "wrappers.ShareSubprocVecEnv:init_error", "worker init_error", {"worker_i": i, "tb": msg[1][-2000:]})
                 raise RuntimeError(f"Subproc env worker {i} failed during init:\n{msg[1]}")
-        _parent_dbg("B", "wrappers.ShareSubprocVecEnv:get_num_agents", "sending get_num_agents to worker 0", {})
         self.remotes[0].send(('get_num_agents', None))
         self.num_agents = self.remotes[0].recv()
-        _parent_dbg("B", "wrappers.ShareSubprocVecEnv:num_agents_ok", "got num_agents", {"num_agents": self.num_agents})
         self.remotes[0].send(('get_spaces', None))
         observation_space, share_observation_space, action_space = self.remotes[0].recv()
-        _parent_dbg("B", "wrappers.ShareSubprocVecEnv:spaces_ok", "got spaces", {})
         ShareVecEnv.__init__(
             self, len(env_fns), observation_space, share_observation_space, action_space
         )
-        _parent_dbg("B", "wrappers.ShareSubprocVecEnv:init_done", "vec env init complete", {"num_envs": len(env_fns)})
 
     def step_async(self, actions):
         env_actions = torch.transpose(torch.stack(actions), 1, 0)
@@ -661,25 +555,10 @@ class ShareSubprocVecEnv(ShareVecEnv):
             remote.send(('reset', None))
         results = [remote.recv() for remote in self.remotes]
         obs, share_obs, available_actions = zip(*results)
-        try:
-            obs_t = _stack_ma_agent_batch(obs, self.device)
-            share_t = _stack_ma_agent_batch(share_obs, self.device)
-            avail_t = torch.tensor(np.stack(available_actions), dtype=torch.float32, device=self.device)
-        except Exception as exc:
-            _agent_dbg(
-                "F",
-                "wrappers.ShareSubprocVecEnv:reset_stack_fail",
-                "reset tensor stack failed",
-                {"error": repr(exc), "n_results": len(results), "device": str(self.device)},
-            )
-            raise
-        _agent_dbg(
-            "F",
-            "wrappers.ShareSubprocVecEnv:reset_ok",
-            "reset tensors stacked",
-            {"obs_shape": list(obs_t.shape), "device": str(self.device)},
-        )
-        return obs_t, share_t, avail_t
+        obs = _stack_ma_agent_batch(obs, self.device)
+        share_obs = _stack_ma_agent_batch(share_obs, self.device)
+        available_actions = torch.tensor(np.stack(available_actions), dtype=torch.float32, device=self.device)
+        return obs, share_obs, available_actions
 
     
 
