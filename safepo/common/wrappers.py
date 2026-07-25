@@ -266,9 +266,9 @@ class CloudpickleWrapper:
         return cloudpickle.dumps(self.x)
 
     def __setstate__(self, ob):
-        import pickle
+        import cloudpickle
 
-        self.x = pickle.loads(ob)
+        self.x = cloudpickle.loads(ob)
 
 
 class ShareVecEnv(ABC):
@@ -400,7 +400,17 @@ class ShareVecEnv(ABC):
 
 def shareworker(remote, parent_remote, env_fn_wrapper):
     parent_remote.close()
-    env = env_fn_wrapper.x()
+    try:
+        env = env_fn_wrapper.x()
+    except BaseException:
+        import traceback
+
+        try:
+            remote.send(("init_error", traceback.format_exc()))
+        except Exception:
+            pass
+        raise
+    remote.send(("ready", None))
     while True:
         cmd, data = remote.recv()
         if cmd == 'step':
@@ -473,6 +483,19 @@ class ShareSubprocVecEnv(ShareVecEnv):
             p.start()
         for remote in self.work_remotes:
             remote.close()
+        for i, remote in enumerate(self.remotes):
+            try:
+                msg = remote.recv()
+            except EOFError as exc:
+                exit_codes = [p.exitcode for p in self.ps]
+                raise RuntimeError(
+                    f"Subproc env worker {i} died during init (exit codes={exit_codes}). "
+                    "Re-run with --num-envs 1 to surface the traceback, or check stderr."
+                ) from exc
+            if isinstance(msg, tuple) and msg[0] == "init_error":
+                for p in self.ps:
+                    p.join(timeout=1)
+                raise RuntimeError(f"Subproc env worker {i} failed during init:\n{msg[1]}")
         self.remotes[0].send(('get_num_agents', None))
         self.num_agents = self.remotes[0].recv()
         self.remotes[0].send(('get_spaces', None))
