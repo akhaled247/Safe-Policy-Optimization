@@ -478,6 +478,7 @@ def shareworker(remote, parent_remote, env_fn_wrapper):
         elif cmd == 'reset':
             ob, s_ob, available_actions = env.reset()
             remote.send((ob, s_ob, available_actions))
+            _dbg("F", "wrappers.shareworker:reset_sent", "reset response sent", {"pid": os.getpid()})
         elif cmd == 'reset_task':
             ob = env.reset_task()
             remote.send(ob)
@@ -513,6 +514,55 @@ def _ensure_spawn_start_method() -> None:
     except RuntimeError:
         pass
 
+
+def _stack_ma_agent_batch(batch, device):
+    """(n_envs, n_agents, dim) tensor from zip(*worker_results) obs/share_obs payloads."""
+    if isinstance(batch, tuple):
+        batch = list(batch)
+    if not batch:
+        raise ValueError("empty multi-agent batch")
+    first = batch[0]
+    if isinstance(first, (list, tuple)):
+        arr = np.stack([np.stack(env_items) for env_items in batch], axis=0)
+    else:
+        arr = np.stack(batch, axis=0)[np.newaxis, ...]
+    return torch.tensor(arr, dtype=torch.float32, device=device)
+
+
+def _stack_ma_scalar_batch(batch, device):
+    """Stack per-env agent scalars/lists (rewards, costs, dones) to (n_envs, n_agents, ...)."""
+    if isinstance(batch, tuple):
+        batch = list(batch)
+    first = batch[0]
+    if isinstance(first, (list, tuple)):
+        arr = np.stack([np.asarray(env_items) for env_items in batch], axis=0)
+    else:
+        arr = np.asarray(batch)[np.newaxis, ...]
+    return torch.tensor(arr, dtype=torch.float32, device=device)
+
+
+def _agent_dbg(hyp, loc, msg, data=None, run_id="post-fix"):
+    # #region agent log
+    import json
+    import time
+    from pathlib import Path
+
+    try:
+        log_path = Path(__file__).resolve().parents[3] / "debug-5d8186.log"
+        payload = {
+            "sessionId": "5d8186",
+            "hypothesisId": hyp,
+            "location": loc,
+            "message": msg,
+            "data": data or {},
+            "timestamp": int(time.time() * 1000),
+            "runId": run_id,
+        }
+        with log_path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(payload) + "\n")
+    except Exception:
+        pass
+    # #endregion
 
 class ShareSubprocVecEnv(ShareVecEnv):
     def __init__(self, env_fns, device=torch.device("cpu")):
@@ -598,19 +648,38 @@ class ShareSubprocVecEnv(ShareVecEnv):
         results = [remote.recv() for remote in self.remotes]
         self.waiting = False
         obs, share_obs, rews, costs, dones, infos, available_actions = zip(*results)
-        obs, share_obs, rews, costs, dones, available_actions = map(
-            lambda x: torch.tensor(np.stack(x), device=self.device), (obs, share_obs, rews, costs, dones, available_actions)
-        )
+        obs = _stack_ma_agent_batch(obs, self.device)
+        share_obs = _stack_ma_agent_batch(share_obs, self.device)
+        rews = _stack_ma_scalar_batch(rews, self.device)
+        costs = _stack_ma_scalar_batch(costs, self.device)
+        dones = _stack_ma_scalar_batch(dones, self.device)
+        available_actions = torch.tensor(np.stack(available_actions), dtype=torch.float32, device=self.device)
         return obs, share_obs, rews, costs, dones, infos, available_actions
 
     def reset(self):
         for remote in self.remotes:
             remote.send(('reset', None))
         results = [remote.recv() for remote in self.remotes]
-        obs, share_obs, available_actions = map(
-            lambda x: torch.tensor(np.stack(x), device=self.device), zip(*results)
+        obs, share_obs, available_actions = zip(*results)
+        try:
+            obs_t = _stack_ma_agent_batch(obs, self.device)
+            share_t = _stack_ma_agent_batch(share_obs, self.device)
+            avail_t = torch.tensor(np.stack(available_actions), dtype=torch.float32, device=self.device)
+        except Exception as exc:
+            _agent_dbg(
+                "F",
+                "wrappers.ShareSubprocVecEnv:reset_stack_fail",
+                "reset tensor stack failed",
+                {"error": repr(exc), "n_results": len(results), "device": str(self.device)},
+            )
+            raise
+        _agent_dbg(
+            "F",
+            "wrappers.ShareSubprocVecEnv:reset_ok",
+            "reset tensors stacked",
+            {"obs_shape": list(obs_t.shape), "device": str(self.device)},
         )
-        return obs, share_obs, available_actions
+        return obs_t, share_t, avail_t
 
     
 
@@ -647,9 +716,10 @@ class ShareDummyVecEnv(ShareVecEnv):
 
     def reset(self):
         results = [env.reset() for env in self.envs]
-        obs, share_obs, available_actions = map(
-            lambda x: torch.tensor(np.stack(x), device=self.device), zip(*results)
-        )
+        obs, share_obs, available_actions = zip(*results)
+        obs = _stack_ma_agent_batch(obs, self.device)
+        share_obs = _stack_ma_agent_batch(share_obs, self.device)
+        available_actions = torch.tensor(np.stack(available_actions), dtype=torch.float32, device=self.device)
         return obs, share_obs, available_actions
 
     def render(self):
