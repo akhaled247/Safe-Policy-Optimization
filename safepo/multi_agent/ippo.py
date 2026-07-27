@@ -160,7 +160,6 @@ def _build_bundles(
                 start_factor=1.0,
                 end_factor=ppo_cfg["lr_end_factor"],
                 total_iters=max(epochs, 1),
-                verbose=False,
             )
             lagrange = None
             if use_lagrange and not share_policy:
@@ -435,13 +434,13 @@ class Runner:
         epoch_end: bool,
         done: bool,
     ) -> None:
-        for bundle in self.bundles:
+        for agent_id, bundle in enumerate(self.bundles):
             last_r = torch.zeros(1, device=self.device)
             last_c = torch.zeros(1, device=self.device)
             if not done and epoch_end:
                 with torch.no_grad():
                     _, _, last_r, last_c = bundle.policy.step(
-                        obs[env_idx].unsqueeze(0), deterministic=False
+                        obs[env_idx, agent_id], deterministic=False
                     )
                 last_r = last_r.unsqueeze(0)
                 last_c = last_c.unsqueeze(0)
