@@ -474,7 +474,18 @@ class Runner:
             cfg_train["log_dir"], f"models_seed{cfg_train['seed']}"
         )
         os.makedirs(self.save_dir, exist_ok=True)
-        self.logger.save_config(cfg_train)
+        cfg_for_log = dict(cfg_train)
+        nmb = int(self.ppo_cfg["num_mini_batch"])
+        steps = int(self.ppo_cfg["steps_per_epoch"])
+        cfg_for_log["num_agents"] = self.num_agents
+        cfg_for_log["num_mini_batch"] = nmb
+        cfg_for_log["num_mini_batches"] = nmb
+        cfg_for_log["mini_batch_size_per_agent"] = steps // nmb
+        if self.share_policy:
+            cfg_for_log["mini_batch_size_shared_merge"] = (
+                steps * self.num_agents
+            ) // nmb
+        self.logger.save_config(cfg_for_log)
 
         self.shared_lagrange = (
             self.bundles[0].lagrange
