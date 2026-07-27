@@ -49,10 +49,8 @@ def _cfg_train_to_ppo_config(cfg_train: dict[str, Any]) -> dict[str, Any]:
     ep_len = int(cfg_train.get("episode_length", 1000))
     steps_per_epoch = ep_len * n_env
     hidden = int(cfg_train.get("hidden_size", 64))
+    # MAPPO-style: split buffer into num_mini_batch chunks (ignore SA batch_size).
     num_mini_batch = max(1, int(cfg_train.get("num_mini_batch", 1)))
-    batch_size = int(cfg_train.get("batch_size", 0))
-    if batch_size <= 0:
-        batch_size = max(64, steps_per_epoch // num_mini_batch)
     ent = cfg_train.get("ent_coef", cfg_train.get("entropy_coef", 0.0))
     return {
         "steps_per_epoch": steps_per_epoch,
@@ -68,7 +66,6 @@ def _cfg_train_to_ppo_config(cfg_train: dict[str, Any]) -> dict[str, Any]:
         "learning_iters": int(cfg_train.get("learning_iters", 10)),
         "target_kl": float(cfg_train.get("target_kl", 0.05)),
         "max_grad_norm": float(cfg_train.get("max_grad_norm", 40.0)),
-        "batch_size": batch_size,
         "num_mini_batch": num_mini_batch,
         "actor_lr": float(cfg_train.get("actor_lr", 3e-4)),
         "critic_lr": float(cfg_train.get("critic_lr", 3e-4)),
@@ -252,6 +249,15 @@ def _ppo_update_agent(
     if batch_steps <= 0:
         return 0, 0.0
 
+    num_mini_batch = max(1, int(ppo_cfg.get("num_mini_batch", 1)))
+    if batch_steps < num_mini_batch:
+        raise ValueError(
+            f"IPPO needs buffer length ({batch_steps}) >= num_mini_batch ({num_mini_batch}) "
+            "(MAPPO-style split)."
+        )
+    # Same as SeparatedReplayBuffer.feed_forward_generator: floor-divide, drop remainder.
+    mini_batch_size = batch_steps // num_mini_batch
+
     old_distribution = bundle.policy.actor(data["obs"])
     advantage = data["adv_r"]
     if use_lagrange and bundle.lagrange is not None:
@@ -267,8 +273,9 @@ def _ppo_update_agent(
             data["target_value_c"],
             advantage,
         ),
-        batch_size=ppo_cfg["batch_size"],
+        batch_size=mini_batch_size,
         shuffle=True,
+        drop_last=True,
     )
     update_counts = 0
     grad_steps = 0
@@ -342,6 +349,8 @@ def _ppo_update_agent(
             "Train/ActorParamDelta": param_delta,
             "Train/PPOBatchSteps": float(batch_steps),
             "Train/PPOGradSteps": float(grad_steps),
+            "Train/NumMiniBatch": float(num_mini_batch),
+            "Train/MiniBatchSize": float(mini_batch_size),
         }
     )
     return update_counts, final_kl
@@ -703,6 +712,8 @@ class Runner:
             self.logger.log_tabular("Train/ActorParamDelta")
             self.logger.log_tabular("Train/PPOBatchSteps")
             self.logger.log_tabular("Train/PPOGradSteps")
+            self.logger.log_tabular("Train/NumMiniBatch")
+            self.logger.log_tabular("Train/MiniBatchSize")
             self.logger.log_tabular("Loss/Loss_reward_critic")
             self.logger.log_tabular("Loss/Loss_cost_critic")
             self.logger.log_tabular("Loss/Loss_actor")
