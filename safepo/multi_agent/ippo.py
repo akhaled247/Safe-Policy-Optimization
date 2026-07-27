@@ -26,6 +26,7 @@ from gymnasium.spaces import Box
 from torch.nn.utils.clip_grad import clip_grad_norm_
 from torch.optim.lr_scheduler import LinearLR
 from torch.utils.data import DataLoader, TensorDataset
+from tqdm import tqdm
 
 from safepo.common.buffer import VectorizedOnPolicyBuffer
 from safepo.common.env import make_ma_isaac_env, make_ma_mujoco_env, make_ma_multi_goal_env
@@ -476,7 +477,14 @@ class Runner:
         ep_len = np.zeros(n_envs, dtype=np.float64)
         agent_ep_cost = np.zeros((n_envs, self.num_agents), dtype=np.float64)
 
-        for epoch in range(self.epochs):
+        for epoch in tqdm(
+            range(self.epochs),
+            desc="IPPO",
+            unit="update",
+            total=self.epochs,
+            file=sys.stderr,
+            dynamic_ncols=True,
+        ):
             for step in range(local_steps):
                 actions_collector = []
                 store_batch = []
