@@ -155,6 +155,7 @@ def _build_bundles(
             cost_opt = torch.optim.Adam(
                 policy.cost_critic.parameters(), lr=ppo_cfg["critic_lr"]
             )
+            # torch>=2.7 dropped LinearLR(verbose=...); do not pass it.
             sched = LinearLR(
                 actor_opt,
                 start_factor=1.0,
@@ -200,14 +201,22 @@ def _build_bundles(
     return bundles
 
 
+def _merge_buffer_data(datas: list[dict[str, torch.Tensor]]) -> dict[str, torch.Tensor]:
+    """Concatenate per-agent buffer.get() dicts along the batch dim."""
+    keys = datas[0].keys()
+    return {k: torch.cat([d[k] for d in datas], dim=0) for k in keys}
+
+
 def _ppo_update_agent(
     bundle: AgentPPOBundle,
     ppo_cfg: dict[str, Any],
     logger: EpochLogger,
     *,
     use_lagrange: bool,
+    data: dict[str, torch.Tensor] | None = None,
 ) -> tuple[int, float]:
-    data = bundle.buffer.get()
+    if data is None:
+        data = bundle.buffer.get()
     old_distribution = bundle.policy.actor(data["obs"])
     advantage = data["adv_r"]
     if use_lagrange and bundle.lagrange is not None:
@@ -296,11 +305,12 @@ def _save_checkpoints(
     bundles: list[AgentPPOBundle], save_dir: str, *, share_policy: bool
 ) -> None:
     os.makedirs(save_dir, exist_ok=True)
-    for agent_id, bundle in enumerate(bundles):
-        aid = 0 if share_policy else agent_id
+    # share_policy → one actor file (actor_agent0.pt); not a bug — both agents share nets.
+    agents = range(1) if share_policy else range(len(bundles))
+    for agent_id in agents:
         torch.save(
-            bundle.policy.actor.state_dict(),
-            os.path.join(save_dir, f"actor_agent{aid}.pt"),
+            bundles[agent_id].policy.actor.state_dict(),
+            os.path.join(save_dir, f"actor_agent{agent_id}.pt"),
         )
 
 
@@ -434,10 +444,16 @@ class Runner:
         epoch_end: bool,
         done: bool,
     ) -> None:
+        # obs: [n_envs, n_agents, obs_dim] — index per agent (not all agents).
+        # Mid-epoch mission success (done, not epoch_end) → zero bootstrap.
+        # Epoch cut / time-limit (epoch_end) → value bootstrap (MA dones merge trunc).
         for agent_id, bundle in enumerate(self.bundles):
             last_r = torch.zeros(1, device=self.device)
             last_c = torch.zeros(1, device=self.device)
-            if not done and epoch_end:
+            need_bootstrap = epoch_end or (not done)
+            if done and not epoch_end:
+                need_bootstrap = False
+            if need_bootstrap:
                 with torch.no_grad():
                     _, _, last_r, last_c = bundle.policy.step(
                         obs[env_idx, agent_id], deterministic=False
@@ -546,15 +562,30 @@ class Runner:
 
             stop_iter = 0
             total_kl = 0.0
-            for bundle in self.bundles:
+            # share_policy=True: one shared ActorVCritic + optimizers. Must NOT run
+            # independent PPO updates per agent (2nd update uses stale log_probs vs
+            # already-updated weights → broken ratios / fake learning signal).
+            if self.share_policy:
+                datas = [b.buffer.get() for b in self.bundles]
+                merged = _merge_buffer_data(datas)
                 iters, kl = _ppo_update_agent(
-                    bundle,
+                    self.bundles[0],
                     self.ppo_cfg,
                     self.logger,
                     use_lagrange=self.use_lagrange,
+                    data=merged,
                 )
-                stop_iter = max(stop_iter, iters)
-                total_kl = max(total_kl, kl)
+                stop_iter, total_kl = iters, kl
+            else:
+                for bundle in self.bundles:
+                    iters, kl = _ppo_update_agent(
+                        bundle,
+                        self.ppo_cfg,
+                        self.logger,
+                        use_lagrange=self.use_lagrange,
+                    )
+                    stop_iter = max(stop_iter, iters)
+                    total_kl = max(total_kl, kl)
 
             if self.rew_deque:
                 self.logger.store(
