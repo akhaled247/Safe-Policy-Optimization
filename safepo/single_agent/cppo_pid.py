@@ -107,7 +107,6 @@ def main(args, cfg_env=None):
         start_factor=1.0,
         end_factor=0.0,
         total_iters=epochs,
-        verbose=False,
     )
     reward_critic_optimizer = torch.optim.Adam(
         policy.reward_critic.parameters(), lr=3e-4
