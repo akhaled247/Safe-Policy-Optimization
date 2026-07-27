@@ -398,6 +398,22 @@ class ShareVecEnv(ABC):
 
 
 
+def _stash_final_obs_in_infos(ob, s_ob, info):
+    """Copy pre-reset obs into per-agent infos (SA vector-env final_observation pattern)."""
+    if not isinstance(info, (list, tuple)):
+        return info
+    for i, agent_info in enumerate(info):
+        if not isinstance(agent_info, dict):
+            continue
+        if isinstance(ob, (list, tuple)) and i < len(ob):
+            agent_info["final_observation"] = np.asarray(ob[i], dtype=np.float32).copy()
+        if isinstance(s_ob, (list, tuple)) and i < len(s_ob):
+            agent_info["final_share_observation"] = np.asarray(s_ob[i], dtype=np.float32).copy()
+        elif s_ob is not None and not isinstance(s_ob, (list, tuple)):
+            agent_info["final_share_observation"] = np.asarray(s_ob, dtype=np.float32).copy()
+    return info
+
+
 def shareworker(remote, parent_remote, env_fn_wrapper):
     parent_remote.close()
     try:
@@ -420,9 +436,11 @@ def shareworker(remote, parent_remote, env_fn_wrapper):
             ob, s_ob, reward, cost, done, info, available_actions = env.step(data)
             if 'bool' in done.__class__.__name__:
                 if done:
+                    info = _stash_final_obs_in_infos(ob, s_ob, info)
                     ob, s_ob, available_actions = env.reset()
             else:
                 if np.all(done):
+                    info = _stash_final_obs_in_infos(ob, s_ob, info)
                     ob, s_ob, available_actions = env.reset()
 
             remote.send((ob, s_ob, reward, cost, done, info, available_actions))
@@ -580,15 +598,27 @@ class ShareDummyVecEnv(ShareVecEnv):
 
     def step_wait(self):
         results = [env.step(a) for (a, env) in zip(self.actions, self.envs)]
-        obs, share_obs, rews, cos, dones, infos, available_actions = map(np.array, zip(*results))
+        obs, share_obs, rews, cos, dones, infos, available_actions = zip(*results)
+        # infos stays as tuple of per-env info lists (do not np.array — ragged dicts)
+        infos = list(infos)
+        obs = list(obs)
+        share_obs = list(share_obs)
+        available_actions = list(available_actions)
+        dones = list(dones)
 
         for i, done in enumerate(dones):
             if np.all(done):
+                infos[i] = _stash_final_obs_in_infos(obs[i], share_obs[i], infos[i])
                 obs[i], share_obs[i], available_actions[i] = self.envs[i].reset()
         self.actions = None
 
-        obs, share_obs, rews, cos, dones, available_actions = map(
-            lambda x: torch.tensor(x).to(self.device), (obs, share_obs, rews, cos, dones, available_actions)
+        obs = _stack_ma_agent_batch(obs, self.device)
+        share_obs = _stack_ma_agent_batch(share_obs, self.device)
+        rews = _stack_ma_scalar_batch(rews, self.device)
+        cos = _stack_ma_scalar_batch(cos, self.device)
+        dones = _stack_ma_scalar_batch(dones, self.device)
+        available_actions = torch.tensor(
+            np.stack(available_actions), dtype=torch.float32, device=self.device
         )
 
         return obs, share_obs, rews, cos, dones, infos, available_actions

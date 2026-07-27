@@ -31,6 +31,10 @@ from safepo.common.popart import PopArt
 from safepo.common.model import MultiAgentActor as Actor, MultiAgentCritic as Critic
 from safepo.common.buffer import SeparatedReplayBuffer
 from safepo.common.logger import EpochLogger
+from safepo.multi_agent.ma_episode_metrics import (
+    make_metric_deques,
+    record_sa_style_episode_metrics,
+)
 from safepo.utils.config import multi_agent_args, parse_sim_params, set_np_formatting, set_seed, multi_agent_velocity_map, isaac_gym_map, multi_agent_goal_tasks
 
 
@@ -486,14 +490,11 @@ class Runner:
         train_episode_rewards = torch.zeros(1, self.config["n_rollout_threads"], device=self.config["device"])
         train_episode_costs = torch.zeros(1, self.config["n_rollout_threads"], device=self.config["device"])
         train_episode_lens = torch.zeros(1, self.config["n_rollout_threads"], device=self.config["device"])
+        rew_deque, cost_deque, len_deque = make_metric_deques()
         eval_rewards=0.0
         eval_costs=0.0
         eval_lens=0.0
         for episode in range(episodes):
-
-            done_episodes_rewards = []
-            done_episodes_costs = []
-            done_episodes_lens = []
 
             for step in range(self.config["episode_length"]):
                 # Sample actions
@@ -512,11 +513,17 @@ class Runner:
 
                 for t in range(self.config["n_rollout_threads"]):
                     if dones_env[t]:
-                        done_episodes_rewards.append(train_episode_rewards[:, t].clone())
+                        record_sa_style_episode_metrics(
+                            self.logger,
+                            rew_deque,
+                            cost_deque,
+                            len_deque,
+                            float(train_episode_rewards[:, t].item()),
+                            float(train_episode_costs[:, t].item()),
+                            float(train_episode_lens[:, t].item()),
+                        )
                         train_episode_rewards[:, t] = 0
-                        done_episodes_costs.append(train_episode_costs[:, t].clone())
                         train_episode_costs[:, t] = 0
-                        done_episodes_lens.append(train_episode_lens[:, t].clone())
                         train_episode_lens[:, t] = 0
 
                 done_episodes_costs_aver = train_episode_costs.mean()
@@ -538,16 +545,10 @@ class Runner:
             if episode % self.config["eval_interval"] == 0 and self.config["use_eval"]:
                 eval_rewards, eval_costs, eval_lens = self.eval()
 
-            if len(done_episodes_rewards) != 0:
-                aver_episode_rewards = torch.stack(done_episodes_rewards).mean()
-                aver_episode_costs = torch.stack(done_episodes_costs).mean()
-                aver_episode_lens = torch.stack(done_episodes_lens).mean()
-                self.return_aver_cost(aver_episode_costs)
+            if len(len_deque) != 0:
+                self.return_aver_cost(torch.tensor(float(np.mean(cost_deque)), device=self.config["device"]))
                 self.logger.store(
                     **{
-                        "Metrics/EpRet": aver_episode_rewards.item(),
-                        "Metrics/EpCost": aver_episode_costs.item(),
-                        "Metrics/EpLen": aver_episode_lens.item(),
                         "Eval/EpRet": eval_rewards,
                         "Eval/EpCost": eval_costs,
                         "Eval/EpLen": eval_lens,

@@ -4,7 +4,7 @@ experiment_name: specrlbench
 seed: 0
 run_dir: ./runs
 num_env_steps: 4000000
-episode_length: 2500
+episode_length: 4096
 n_rollout_threads: 8
 n_eval_rollout_threads: 1
 hidden_size: 64
@@ -64,7 +64,7 @@ std_y_coef: 0.5
 # Merged for PointLTL*MASAR2* (±WC/AC) via multi_agent_args — keep in sync with SpecRLBench MA_SPECRL_RECIPE_B
 mamujoco:
   num_env_steps: 4000000
-  episode_length: 2500
+  episode_length: 4096
   n_rollout_threads: 8
   n_eval_rollout_threads: 1
   hidden_size: 64
