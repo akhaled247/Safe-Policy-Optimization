@@ -343,16 +343,16 @@ def _ppo_update_agent(
     if bundle.actor_scheduler is not None:
         bundle.actor_scheduler.step()
 
-    param_delta = _actor_param_delta_norm(bundle.policy, actor_params_before)
-    logger.store(
-        **{
-            "Train/ActorParamDelta": param_delta,
-            "Train/PPOBatchSteps": float(batch_steps),
-            "Train/PPOGradSteps": float(grad_steps),
-            "Train/NumMiniBatch": float(num_mini_batch),
-            "Train/MiniBatchSize": float(mini_batch_size),
-        }
-    )
+    # param_delta = _actor_param_delta_norm(bundle.policy, actor_params_before)
+    # logger.store(
+    #     **{
+    #         "Train/ActorParamDelta": param_delta,
+    #         "Train/PPOBatchSteps": float(batch_steps),
+    #         "Train/PPOGradSteps": float(grad_steps),
+    #         "Train/NumMiniBatch": float(num_mini_batch),
+    #         "Train/MiniBatchSize": float(mini_batch_size),
+    #     }
+    # )
     return update_counts, final_kl
 
 
