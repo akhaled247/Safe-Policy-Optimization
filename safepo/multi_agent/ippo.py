@@ -85,7 +85,8 @@ def _cfg_train_to_ppo_config(cfg_train: dict[str, Any]) -> dict[str, Any]:
         "share_policy": bool(cfg_train.get("share_policy", True)),
         "save_interval": int(cfg_train.get("save_interval", 10)),
         "use_eval": bool(cfg_train.get("use_eval", False)),
-        "eval_episodes": int(cfg_train.get("eval_episodes", 1)),
+        "eval_episodes": int(cfg_train.get("eval_episodes", 25)),
+        "eval_interval": int(cfg_train.get("eval_interval", 0)),
         "seed": int(cfg_train.get("seed", 0)),
         "device": cfg_train.get("device", "cpu"),
     }
@@ -400,7 +401,12 @@ def build_ma_envs(args, cfg_train, cfg_env=None):
         eval_env = env
     elif args.task in multi_agent_goal_tasks:
         env = make_ma_multi_goal_env(task=args.task, seed=args.seed, cfg_train=cfg_train)
-        if cfg_train.get("use_eval") or getattr(args, "model_dir", ""):
+        need_eval = (
+            cfg_train.get("use_eval")
+            or getattr(args, "model_dir", "")
+            or int(cfg_train.get("eval_interval", 0)) > 0
+        )
+        if need_eval:
             cfg_eval = copy.deepcopy(cfg_train)
             cfg_eval["seed"] = args.seed + 10000
             cfg_eval["n_rollout_threads"] = cfg_eval["n_eval_rollout_threads"]
@@ -482,9 +488,19 @@ class Runner:
         return torch.as_tensor(x, dtype=torch.float32, device=self.device)
 
     def _record_episode_metrics(self, env_idx: int) -> None:
-        self.rew_deque.append(self._ep_ret[env_idx])
-        self.cost_deque.append(self._ep_cost[env_idx])
-        self.len_deque.append(self._ep_len[env_idx])
+        ret = float(self._ep_ret[env_idx])
+        cost = float(self._ep_cost[env_idx])
+        length = float(self._ep_len[env_idx])
+        self.rew_deque.append(ret)
+        self.cost_deque.append(cost)
+        self.len_deque.append(length)
+        self.logger.store(
+            **{
+                "Metrics/EpRet": ret,
+                "Metrics/EpCost": cost,
+                "Metrics/EpLen": length,
+            }
+        )
         if self.use_lagrange and not self.share_policy:
             for a, bundle in enumerate(self.bundles):
                 if bundle.cost_deque is not None:
@@ -605,8 +621,16 @@ class Runner:
                             self._record_episode_metrics(env_idx)
 
             eval_rew = eval_cost = eval_len = 0.0
-            if self.ppo_cfg["use_eval"] and self.eval_envs is not None:
-                eval_rew, eval_cost, eval_len = self._eval()
+            eval_iv = int(self.ppo_cfg.get("eval_interval", 0))
+            run_eval = self.eval_envs is not None and (
+                self.ppo_cfg["use_eval"]
+                or (
+                    eval_iv > 0
+                    and (epoch % eval_iv == 0 or epoch == self.epochs - 1)
+                )
+            )
+            if run_eval:
+                eval_rew, eval_cost, eval_len = self._eval(deterministic=True)
 
             if self.use_lagrange:
                 if self.shared_lagrange is not None and self.cost_deque:
@@ -647,17 +671,17 @@ class Runner:
                     stop_iter = max(stop_iter, iters)
                     total_kl = max(total_kl, kl)
 
-            if self.rew_deque:
-                self.logger.store(
-                    **{
-                        "Metrics/EpRet": float(np.mean(self.rew_deque)),
-                        "Metrics/EpCost": float(np.mean(self.cost_deque)),
-                        "Metrics/EpLen": float(np.mean(self.len_deque)),
-                        "Eval/EpRet": eval_rew,
-                        "Eval/EpCost": eval_cost,
-                        "Eval/EpLen": eval_len,
-                    }
-                )
+            for key in ("Metrics/EpRet", "Metrics/EpCost", "Metrics/EpLen"):
+                if key not in self.logger.epoch_dict or len(self.logger.epoch_dict[key]) == 0:
+                    self.logger.store(**{key: 0.0})
+
+            self.logger.store(
+                **{
+                    "Eval/EpRet": eval_rew,
+                    "Eval/EpCost": eval_cost,
+                    "Eval/EpLen": eval_len,
+                }
+            )
 
             if epoch % self.ppo_cfg["save_interval"] == 0 or epoch == self.epochs - 1:
                 _save_checkpoints(
@@ -687,15 +711,15 @@ class Runner:
             self.logger.log_tabular("Time/FPS", int(total_steps / max(end - start, 1e-6)))
             self.logger.dump_tabular()
 
-    def _eval(self) -> tuple[float, float, float]:
+    def _eval(self, *, deterministic: bool = True) -> tuple[float, float, float]:
         target = max(1, int(self.ppo_cfg["eval_episodes"]))
         eval_env = self.eval_envs
-        n_eval = int(self.ppo_cfg["num_envs"])
+        obs, _, _ = eval_env.reset()
+        obs = self._as_tensor(obs)
+        n_eval = int(obs.shape[0])
         eval_rews: list[float] = []
         eval_costs: list[float] = []
         eval_lens: list[float] = []
-        obs, _, _ = eval_env.reset()
-        obs = self._as_tensor(obs)
         ep_rew = np.zeros(n_eval)
         ep_cost = np.zeros(n_eval)
         ep_len = np.zeros(n_eval)
@@ -706,7 +730,7 @@ class Runner:
             for agent_id, bundle in enumerate(self.bundles):
                 with torch.no_grad():
                     act, _, _, _ = bundle.policy.step(
-                        obs[:, agent_id], deterministic=True
+                        obs[:, agent_id], deterministic=deterministic
                     )
                 actions.append(act)
             obs, _, rewards, costs, dones, _, _ = eval_env.step(actions)
@@ -735,9 +759,9 @@ class Runner:
             float(np.mean(eval_lens)),
         )
 
-    def eval(self, eval_episodes: int = 100000) -> None:
+    def eval(self, eval_episodes: int = 100000, *, deterministic: bool = True) -> None:
         self.ppo_cfg["eval_episodes"] = eval_episodes
-        r, c, l = self._eval()
+        r, c, l = self._eval(deterministic=deterministic)
         print(f"Eval EpRet={r:.4f} EpCost={c:.4f} EpLen={l:.2f}")
 
 

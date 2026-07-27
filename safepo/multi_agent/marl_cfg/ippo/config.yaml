@@ -70,8 +70,11 @@ mamujoco:
   hidden_size: 64
   gamma: 0.99
   gae_lambda: 0.95
-  entropy_coef: 0.02
+  entropy_coef: 0.0
+  ent_coef: 0.0
   learning_iters: 10
+  eval_interval: 25
+  eval_episodes: 25
   target_kl: 0.05
   clip_param: 0.2
   actor_lr: 5.e-5
