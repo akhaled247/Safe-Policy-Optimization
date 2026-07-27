@@ -208,6 +208,32 @@ def _merge_buffer_data(datas: list[dict[str, torch.Tensor]]) -> dict[str, torch.
     return {k: torch.cat([d[k] for d in datas], dim=0) for k in keys}
 
 
+def _should_record_episode(
+    *,
+    done: bool,
+    epoch_end: bool,
+    episode_steps: float,
+    rollout_horizon: int,
+) -> bool:
+    """Whether to append this env's episode stats to the rolling train deque.
+
+    Record on natural termination (success, truncation, or env done). Also record
+    when a single episode fills the full rollout horizon without a done signal
+    (timeout-at-horizon). Do **not** record mid-episode rollout cuts — those
+    episodes continue in the next epoch and are logged once when they end.
+    """
+    if done:
+        return True
+    return epoch_end and episode_steps >= float(rollout_horizon)
+
+
+def _actor_param_delta_norm(policy: ActorVCritic, before: list[torch.Tensor]) -> float:
+    after = [p.detach() for p in policy.actor.parameters()]
+    return float(
+        torch.sqrt(sum((a - b).pow(2).sum() for a, b in zip(after, before))).item()
+    )
+
+
 def _ppo_update_agent(
     bundle: AgentPPOBundle,
     ppo_cfg: dict[str, Any],
@@ -218,6 +244,13 @@ def _ppo_update_agent(
 ) -> tuple[int, float]:
     if data is None:
         data = bundle.buffer.get()
+    actor_params_before = [
+        p.detach().clone() for p in bundle.policy.actor.parameters()
+    ]
+    batch_steps = int(data["obs"].shape[0])
+    if batch_steps <= 0:
+        return 0, 0.0
+
     old_distribution = bundle.policy.actor(data["obs"])
     advantage = data["adv_r"]
     if use_lagrange and bundle.lagrange is not None:
@@ -237,6 +270,7 @@ def _ppo_update_agent(
         shuffle=True,
     )
     update_counts = 0
+    grad_steps = 0
     final_kl = 0.0
     ent_coef = float(ppo_cfg["ent_coef"])
     clip = float(ppo_cfg["clip_ratio"])
@@ -276,6 +310,7 @@ def _ppo_update_agent(
             bundle.reward_critic_optimizer.step()
             bundle.cost_critic_optimizer.step()
             bundle.actor_optimizer.step()
+            grad_steps += 1
 
             logger.store(
                 **{
@@ -299,6 +334,15 @@ def _ppo_update_agent(
 
     if bundle.actor_scheduler is not None:
         bundle.actor_scheduler.step()
+
+    param_delta = _actor_param_delta_norm(bundle.policy, actor_params_before)
+    logger.store(
+        **{
+            "Train/ActorParamDelta": param_delta,
+            "Train/PPOBatchSteps": float(batch_steps),
+            "Train/PPOGradSteps": float(grad_steps),
+        }
+    )
     return update_counts, final_kl
 
 
@@ -437,6 +481,19 @@ class Runner:
             return x.to(device=self.device, dtype=torch.float32)
         return torch.as_tensor(x, dtype=torch.float32, device=self.device)
 
+    def _record_episode_metrics(self, env_idx: int) -> None:
+        self.rew_deque.append(self._ep_ret[env_idx])
+        self.cost_deque.append(self._ep_cost[env_idx])
+        self.len_deque.append(self._ep_len[env_idx])
+        if self.use_lagrange and not self.share_policy:
+            for a, bundle in enumerate(self.bundles):
+                if bundle.cost_deque is not None:
+                    bundle.cost_deque.append(self._agent_ep_cost[env_idx, a])
+        self._ep_ret[env_idx] = 0.0
+        self._ep_cost[env_idx] = 0.0
+        self._ep_len[env_idx] = 0.0
+        self._agent_ep_cost[env_idx, :] = 0.0
+
     def _finish_paths(
         self,
         env_idx: int,
@@ -472,10 +529,10 @@ class Runner:
 
         obs, _, _ = self.envs.reset()
         obs = self._as_tensor(obs)
-        ep_ret = np.zeros(n_envs, dtype=np.float64)
-        ep_cost = np.zeros(n_envs, dtype=np.float64)
-        ep_len = np.zeros(n_envs, dtype=np.float64)
-        agent_ep_cost = np.zeros((n_envs, self.num_agents), dtype=np.float64)
+        self._ep_ret = np.zeros(n_envs, dtype=np.float64)
+        self._ep_cost = np.zeros(n_envs, dtype=np.float64)
+        self._ep_len = np.zeros(n_envs, dtype=np.float64)
+        self._agent_ep_cost = np.zeros((n_envs, self.num_agents), dtype=np.float64)
 
         for epoch in tqdm(
             range(self.epochs),
@@ -509,11 +566,13 @@ class Runner:
 
                 reward_env = torch.mean(rewards_t, dim=1).flatten()
                 cost_env = torch.mean(costs_t, dim=1).flatten()
-                ep_ret += reward_env.detach().cpu().numpy()
-                ep_cost += cost_env.detach().cpu().numpy()
-                ep_len += 1.0
+                self._ep_ret += reward_env.detach().cpu().numpy()
+                self._ep_cost += cost_env.detach().cpu().numpy()
+                self._ep_len += 1.0
                 for a in range(self.num_agents):
-                    agent_ep_cost[:, a] += costs_t[:, a].flatten().detach().cpu().numpy()
+                    self._agent_ep_cost[:, a] += (
+                        costs_t[:, a].flatten().detach().cpu().numpy()
+                    )
 
                 for agent_id, bundle in enumerate(self.bundles):
                     o, act, lp, vr, vc = store_batch[agent_id]
@@ -537,20 +596,13 @@ class Runner:
                         self._finish_paths(
                             env_idx, obs, epoch_end=epoch_end, done=done
                         )
-                        if done:
-                            self.rew_deque.append(ep_ret[env_idx])
-                            self.cost_deque.append(ep_cost[env_idx])
-                            self.len_deque.append(ep_len[env_idx])
-                            if self.use_lagrange and not self.share_policy:
-                                for a, bundle in enumerate(self.bundles):
-                                    if bundle.cost_deque is not None:
-                                        bundle.cost_deque.append(
-                                            agent_ep_cost[env_idx, a]
-                                        )
-                            ep_ret[env_idx] = 0.0
-                            ep_cost[env_idx] = 0.0
-                            ep_len[env_idx] = 0.0
-                            agent_ep_cost[env_idx, :] = 0.0
+                        if _should_record_episode(
+                            done=done,
+                            epoch_end=epoch_end,
+                            episode_steps=self._ep_len[env_idx],
+                            rollout_horizon=local_steps,
+                        ):
+                            self._record_episode_metrics(env_idx)
 
             eval_rew = eval_cost = eval_len = 0.0
             if self.ppo_cfg["use_eval"] and self.eval_envs is not None:
@@ -624,6 +676,9 @@ class Runner:
             self.logger.log_tabular("Train/TotalSteps", total_steps)
             self.logger.log_tabular("Train/StopIter", stop_iter)
             self.logger.log_tabular("Train/KL", total_kl)
+            self.logger.log_tabular("Train/ActorParamDelta")
+            self.logger.log_tabular("Train/PPOBatchSteps")
+            self.logger.log_tabular("Train/PPOGradSteps")
             self.logger.log_tabular("Loss/Loss_reward_critic")
             self.logger.log_tabular("Loss/Loss_cost_critic")
             self.logger.log_tabular("Loss/Loss_actor")
@@ -637,6 +692,8 @@ class Runner:
         eval_env = self.eval_envs
         n_eval = int(self.ppo_cfg["num_envs"])
         eval_rews: list[float] = []
+        eval_costs: list[float] = []
+        eval_lens: list[float] = []
         obs, _, _ = eval_env.reset()
         obs = self._as_tensor(obs)
         ep_rew = np.zeros(n_eval)
@@ -664,13 +721,19 @@ class Runner:
             for i in range(n_eval):
                 if dones_env[i]:
                     eval_rews.append(ep_rew[i])
+                    eval_costs.append(ep_cost[i])
+                    eval_lens.append(ep_len[i])
                     ep_rew[i] = ep_cost[i] = ep_len[i] = 0.0
                     completed += 1
                     if completed >= target:
                         break
         if not eval_rews:
             return 0.0, 0.0, 0.0
-        return float(np.mean(eval_rews)), 0.0, 0.0
+        return (
+            float(np.mean(eval_rews)),
+            float(np.mean(eval_costs)),
+            float(np.mean(eval_lens)),
+        )
 
     def eval(self, eval_episodes: int = 100000) -> None:
         self.ppo_cfg["eval_episodes"] = eval_episodes
