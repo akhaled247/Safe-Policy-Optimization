@@ -466,7 +466,7 @@ def shareworker(remote, parent_remote, env_fn_wrapper):
             fr = env.render_vulnerability(data)
             remote.send(fr)
         elif cmd == 'get_num_agents':
-            remote.send(env.num_agents)
+            remote.send(env.unwrapped.num_agents)
         else:
             raise NotImplementedError
 
@@ -585,7 +585,7 @@ class ShareDummyVecEnv(ShareVecEnv):
         self.envs = [fn() for fn in env_fns]
         env = self.envs[0]
         self.device = device
-        self.num_agents=env.num_agents
+        self.num_agents=env.unwrapped.num_agents
         ShareVecEnv.__init__(
             self, len(env_fns), env.observation_spaces, env.share_observation_spaces, env.action_spaces
         )
