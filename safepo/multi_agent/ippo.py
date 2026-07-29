@@ -32,7 +32,7 @@ from safepo.common.buffer import VectorizedOnPolicyBuffer
 from safepo.common.env import make_ma_isaac_env, make_ma_mujoco_env, make_ma_multi_goal_env
 from safepo.common.lagrange import Lagrange
 from safepo.common.logger import EpochLogger
-from safepo.common.model import ActorVCritic
+from safepo.common.model import ActorVCritic, SharedActorLocalCritic
 from safepo.utils.config import (
     isaac_gym_map,
     multi_agent_args,
@@ -119,59 +119,43 @@ def _build_bundles(
     use_lagrange: bool,
     epochs: int,
 ) -> list[AgentPPOBundle]:
-    obs_space, act_space = _box_spaces(obs_dim, act_dim)
-    bundles: list[AgentPPOBundle] = []
-    shared_policy: ActorVCritic | None = None
-    shared_opts: tuple | None = None
-    shared_sched: LinearLR | None = None
-    shared_lagrange: Lagrange | None = None
-
-    if use_lagrange and share_policy:
-        shared_lagrange = Lagrange(
-            cost_limit=ppo_cfg["cost_limit"],
-            lagrangian_multiplier_init=ppo_cfg["lagrangian_multiplier_init"],
-            lagrangian_multiplier_lr=ppo_cfg["lagrangian_multiplier_lr"],
+    if share_policy:
+        return _build_shared_bundles(
+            num_agents, obs_dim, act_dim,
+            device=device, ppo_cfg=ppo_cfg, use_lagrange=use_lagrange, epochs=epochs,
         )
 
+    obs_space, act_space = _box_spaces(obs_dim, act_dim)
+    bundles: list[AgentPPOBundle] = []
+
     for _agent_id in range(num_agents):
-        if share_policy and shared_policy is not None:
-            policy = shared_policy
-            actor_opt, rew_opt, cost_opt = shared_opts  # type: ignore[misc]
-            sched = shared_sched
-            lagrange = shared_lagrange
-        else:
-            policy = ActorVCritic(
-                obs_dim=obs_dim,
-                act_dim=act_dim,
-                hidden_sizes=ppo_cfg["hidden_sizes"],
-            ).to(device)
-            actor_opt = torch.optim.Adam(
-                policy.actor.parameters(), lr=ppo_cfg["actor_lr"]
+        policy = ActorVCritic(
+            obs_dim=obs_dim,
+            act_dim=act_dim,
+            hidden_sizes=ppo_cfg["hidden_sizes"],
+        ).to(device)
+        actor_opt = torch.optim.Adam(
+            policy.actor.parameters(), lr=ppo_cfg["actor_lr"]
+        )
+        rew_opt = torch.optim.Adam(
+            policy.reward_critic.parameters(), lr=ppo_cfg["critic_lr"]
+        )
+        cost_opt = torch.optim.Adam(
+            policy.cost_critic.parameters(), lr=ppo_cfg["critic_lr"]
+        )
+        sched = LinearLR(
+            actor_opt,
+            start_factor=1.0,
+            end_factor=ppo_cfg["lr_end_factor"],
+            total_iters=max(epochs, 1),
+        )
+        lagrange = None
+        if use_lagrange:
+            lagrange = Lagrange(
+                cost_limit=ppo_cfg["cost_limit"],
+                lagrangian_multiplier_init=ppo_cfg["lagrangian_multiplier_init"],
+                lagrangian_multiplier_lr=ppo_cfg["lagrangian_multiplier_lr"],
             )
-            rew_opt = torch.optim.Adam(
-                policy.reward_critic.parameters(), lr=ppo_cfg["critic_lr"]
-            )
-            cost_opt = torch.optim.Adam(
-                policy.cost_critic.parameters(), lr=ppo_cfg["critic_lr"]
-            )
-            # torch>=2.7 dropped LinearLR(verbose=...); do not pass it.
-            sched = LinearLR(
-                actor_opt,
-                start_factor=1.0,
-                end_factor=ppo_cfg["lr_end_factor"],
-                total_iters=max(epochs, 1),
-            )
-            lagrange = None
-            if use_lagrange and not share_policy:
-                lagrange = Lagrange(
-                    cost_limit=ppo_cfg["cost_limit"],
-                    lagrangian_multiplier_init=ppo_cfg["lagrangian_multiplier_init"],
-                    lagrangian_multiplier_lr=ppo_cfg["lagrangian_multiplier_lr"],
-                )
-            if share_policy:
-                shared_policy = policy
-                shared_opts = (actor_opt, rew_opt, cost_opt)
-                shared_sched = sched
 
         buffer = VectorizedOnPolicyBuffer(
             obs_space=obs_space,
@@ -192,18 +176,73 @@ def _build_bundles(
                 cost_critic_optimizer=cost_opt,
                 actor_scheduler=sched,
                 lagrange=lagrange,
-                cost_deque=deque(maxlen=50)
-                if (use_lagrange and not share_policy)
-                else None,
+                cost_deque=deque(maxlen=50) if use_lagrange else None,
             )
         )
     return bundles
 
 
-def _merge_buffer_data(datas: list[dict[str, torch.Tensor]]) -> dict[str, torch.Tensor]:
-    """Concatenate per-agent buffer.get() dicts along the batch dim."""
-    keys = datas[0].keys()
-    return {k: torch.cat([d[k] for d in datas], dim=0) for k in keys}
+def _build_shared_bundles(
+    num_agents: int,
+    obs_dim: int,
+    act_dim: int,
+    *,
+    device: torch.device,
+    ppo_cfg: dict[str, Any],
+    use_lagrange: bool,
+    epochs: int,
+) -> list[AgentPPOBundle]:
+    """Single shared actor + local critics + one merged buffer (n_envs * num_agents slots)."""
+    obs_space, act_space = _box_spaces(obs_dim, act_dim)
+    policy = SharedActorLocalCritic(
+        obs_dim, act_dim, num_agents, hidden_sizes=ppo_cfg["hidden_sizes"],
+    ).to(device)
+    actor_opt = torch.optim.Adam(policy.actor.parameters(), lr=ppo_cfg["actor_lr"])
+    rew_opts = [
+        torch.optim.Adam(policy.reward_critics[i].parameters(), lr=ppo_cfg["critic_lr"])
+        for i in range(num_agents)
+    ]
+    cost_opts = [
+        torch.optim.Adam(policy.cost_critics[i].parameters(), lr=ppo_cfg["critic_lr"])
+        for i in range(num_agents)
+    ]
+    sched = LinearLR(
+        actor_opt,
+        start_factor=1.0,
+        end_factor=ppo_cfg["lr_end_factor"],
+        total_iters=max(epochs, 1),
+    )
+    lagrange = None
+    if use_lagrange:
+        lagrange = Lagrange(
+            cost_limit=ppo_cfg["cost_limit"],
+            lagrangian_multiplier_init=ppo_cfg["lagrangian_multiplier_init"],
+            lagrangian_multiplier_lr=ppo_cfg["lagrangian_multiplier_lr"],
+        )
+    flat_envs = ppo_cfg["num_envs"] * num_agents
+    buffer = VectorizedOnPolicyBuffer(
+        obs_space=obs_space,
+        act_space=act_space,
+        size=ppo_cfg["local_steps_per_epoch"],
+        device=device,
+        num_envs=flat_envs,
+        gamma=ppo_cfg["gamma"],
+        lam=ppo_cfg["lam"],
+        lam_c=ppo_cfg["lam_c"],
+    )
+    bundle = AgentPPOBundle(
+        policy=policy,
+        buffer=buffer,
+        actor_optimizer=actor_opt,
+        reward_critic_optimizer=rew_opts[0],  # placeholder; shared path uses rew_opts list on bundle
+        cost_critic_optimizer=cost_opts[0],
+        actor_scheduler=sched,
+        lagrange=lagrange,
+        cost_deque=deque(maxlen=50) if use_lagrange else None,
+    )
+    bundle.reward_critic_optimizers = rew_opts  # type: ignore[attr-defined]
+    bundle.cost_critic_optimizers = cost_opts  # type: ignore[attr-defined]
+    return [bundle]
 
 
 def _should_record_episode(
@@ -239,6 +278,7 @@ def _ppo_update_agent(
     *,
     use_lagrange: bool,
     data: dict[str, torch.Tensor] | None = None,
+    num_agents: int = 1,
 ) -> tuple[int, float]:
     if data is None:
         data = bundle.buffer.get()
@@ -255,8 +295,12 @@ def _ppo_update_agent(
             f"IPPO needs buffer length ({batch_steps}) >= num_mini_batch ({num_mini_batch}) "
             "(MAPPO-style split)."
         )
-    # Same as SeparatedReplayBuffer.feed_forward_generator: floor-divide, drop remainder.
     mini_batch_size = batch_steps // num_mini_batch
+    shared_local = isinstance(bundle.policy, SharedActorLocalCritic)
+    agent_ids_full = (
+        torch.arange(batch_steps, device=data["obs"].device) % num_agents
+        if shared_local else None
+    )
 
     old_distribution = bundle.policy.actor(data["obs"])
     advantage = data["adv_r"]
@@ -264,15 +308,18 @@ def _ppo_update_agent(
         lam = bundle.lagrange.lagrangian_multiplier
         advantage = (data["adv_r"] - lam * data["adv_c"]) / (lam + 1)
 
+    dataset_tensors = [
+        data["obs"],
+        data["act"],
+        data["log_prob"],
+        data["target_value_r"],
+        data["target_value_c"],
+        advantage,
+    ]
+    if shared_local:
+        dataset_tensors.append(agent_ids_full)
     dataloader = DataLoader(
-        TensorDataset(
-            data["obs"],
-            data["act"],
-            data["log_prob"],
-            data["target_value_r"],
-            data["target_value_c"],
-            advantage,
-        ),
+        TensorDataset(*dataset_tensors),
         batch_size=mini_batch_size,
         shuffle=True,
         drop_last=True,
@@ -282,22 +329,47 @@ def _ppo_update_agent(
     final_kl = 0.0
     ent_coef = float(ppo_cfg["ent_coef"])
     clip = float(ppo_cfg["clip_ratio"])
+    rew_opts = getattr(bundle, "reward_critic_optimizers", None)
+    cost_opts = getattr(bundle, "cost_critic_optimizers", None)
 
     for _ in range(ppo_cfg["learning_iters"]):
-        for obs_b, act_b, log_prob_b, target_r_b, target_c_b, adv_b in dataloader:
-            bundle.reward_critic_optimizer.zero_grad()
-            loss_r = nn.functional.mse_loss(
-                bundle.policy.reward_critic(obs_b), target_r_b
-            )
-            bundle.cost_critic_optimizer.zero_grad()
-            loss_c = nn.functional.mse_loss(
-                bundle.policy.cost_critic(obs_b), target_c_b
-            )
-            if ppo_cfg.get("use_critic_norm", True):
-                for param in bundle.policy.reward_critic.parameters():
-                    loss_r = loss_r + param.pow(2).sum() * 0.001
-                for param in bundle.policy.cost_critic.parameters():
-                    loss_c = loss_c + param.pow(2).sum() * 0.001
+        for batch in dataloader:
+            if shared_local:
+                obs_b, act_b, log_prob_b, target_r_b, target_c_b, adv_b, agent_ids_b = batch
+            else:
+                obs_b, act_b, log_prob_b, target_r_b, target_c_b, adv_b = batch
+                agent_ids_b = None
+
+            if shared_local:
+                for opt in rew_opts:
+                    opt.zero_grad()
+                for opt in cost_opts:
+                    opt.zero_grad()
+                pred_r = bundle.policy.reward_values(obs_b, agent_ids_b)
+                pred_c = bundle.policy.cost_values(obs_b, agent_ids_b)
+                loss_r = nn.functional.mse_loss(pred_r, target_r_b)
+                loss_c = nn.functional.mse_loss(pred_c, target_c_b)
+                if ppo_cfg.get("use_critic_norm", True):
+                    for critic in bundle.policy.reward_critics:
+                        for param in critic.parameters():
+                            loss_r = loss_r + param.pow(2).sum() * 0.001
+                    for critic in bundle.policy.cost_critics:
+                        for param in critic.parameters():
+                            loss_c = loss_c + param.pow(2).sum() * 0.001
+            else:
+                bundle.reward_critic_optimizer.zero_grad()
+                loss_r = nn.functional.mse_loss(
+                    bundle.policy.reward_critic(obs_b), target_r_b
+                )
+                bundle.cost_critic_optimizer.zero_grad()
+                loss_c = nn.functional.mse_loss(
+                    bundle.policy.cost_critic(obs_b), target_c_b
+                )
+                if ppo_cfg.get("use_critic_norm", True):
+                    for param in bundle.policy.reward_critic.parameters():
+                        loss_r = loss_r + param.pow(2).sum() * 0.001
+                    for param in bundle.policy.cost_critic.parameters():
+                        loss_c = loss_c + param.pow(2).sum() * 0.001
 
             distribution = bundle.policy.actor(obs_b)
             log_prob = distribution.log_prob(act_b).sum(dim=-1)
@@ -315,8 +387,14 @@ def _ppo_update_agent(
             )
             total_loss.backward()
             clip_grad_norm_(bundle.policy.parameters(), ppo_cfg["max_grad_norm"])
-            bundle.reward_critic_optimizer.step()
-            bundle.cost_critic_optimizer.step()
+            if shared_local:
+                for opt in rew_opts:
+                    opt.step()
+                for opt in cost_opts:
+                    opt.step()
+            else:
+                bundle.reward_critic_optimizer.step()
+                bundle.cost_critic_optimizer.step()
             bundle.actor_optimizer.step()
             grad_steps += 1
 
@@ -343,16 +421,6 @@ def _ppo_update_agent(
     if bundle.actor_scheduler is not None:
         bundle.actor_scheduler.step()
 
-    # param_delta = _actor_param_delta_norm(bundle.policy, actor_params_before)
-    # logger.store(
-    #     **{
-    #         "Train/ActorParamDelta": param_delta,
-    #         "Train/PPOBatchSteps": float(batch_steps),
-    #         "Train/PPOGradSteps": float(grad_steps),
-    #         "Train/NumMiniBatch": float(num_mini_batch),
-    #         "Train/MiniBatchSize": float(mini_batch_size),
-    #     }
-    # )
     return update_counts, final_kl
 
 
@@ -538,9 +606,28 @@ class Runner:
         epoch_end: bool,
         done: bool,
     ) -> None:
-        # obs: [n_envs, n_agents, obs_dim] — index per agent (not all agents).
-        # Mid-epoch mission success (done, not epoch_end) → zero bootstrap.
-        # Epoch cut / time-limit (epoch_end) → value bootstrap (MA dones merge trunc).
+        if self.share_policy and len(self.bundles) == 1:
+            bundle = self.bundles[0]
+            policy = bundle.policy
+            for agent_id in range(self.num_agents):
+                flat_idx = env_idx * self.num_agents + agent_id
+                last_r = torch.zeros(1, device=self.device)
+                last_c = torch.zeros(1, device=self.device)
+                need_bootstrap = epoch_end or (not done)
+                if done and not epoch_end:
+                    need_bootstrap = False
+                if need_bootstrap:
+                    with torch.no_grad():
+                        _, _, last_r, last_c = policy.step(
+                            obs[env_idx, agent_id], agent_id, deterministic=False,
+                        )
+                    last_r = last_r.unsqueeze(0)
+                    last_c = last_c.unsqueeze(0)
+                bundle.buffer.finish_path(
+                    last_value_r=last_r, last_value_c=last_c, idx=flat_idx,
+                )
+            return
+
         for agent_id, bundle in enumerate(self.bundles):
             last_r = torch.zeros(1, device=self.device)
             last_c = torch.zeros(1, device=self.device)
@@ -582,16 +669,30 @@ class Runner:
                 actions_collector = []
                 store_batch = []
 
-                for agent_id, bundle in enumerate(self.bundles):
-                    obs_agent = obs[:, agent_id]
-                    with torch.no_grad():
-                        act, log_prob, value_r, value_c = bundle.policy.step(
-                            obs_agent, deterministic=False
+                if self.share_policy and len(self.bundles) == 1:
+                    bundle = self.bundles[0]
+                    policy = bundle.policy
+                    for agent_id in range(self.num_agents):
+                        obs_agent = obs[:, agent_id]
+                        with torch.no_grad():
+                            act, log_prob, value_r, value_c = policy.step(
+                                obs_agent, agent_id, deterministic=False,
+                            )
+                        actions_collector.append(act)
+                        store_batch.append(
+                            (obs_agent, act, log_prob, value_r, value_c),
                         )
-                    actions_collector.append(act)
-                    store_batch.append(
-                        (obs_agent, act, log_prob, value_r, value_c)
-                    )
+                else:
+                    for agent_id, bundle in enumerate(self.bundles):
+                        obs_agent = obs[:, agent_id]
+                        with torch.no_grad():
+                            act, log_prob, value_r, value_c = bundle.policy.step(
+                                obs_agent, deterministic=False
+                            )
+                        actions_collector.append(act)
+                        store_batch.append(
+                            (obs_agent, act, log_prob, value_r, value_c)
+                        )
 
                 obs, _, rewards, costs, dones, _infos, _ = self.envs.step(
                     actions_collector
@@ -610,17 +711,40 @@ class Runner:
                         costs_t[:, a].flatten().detach().cpu().numpy()
                     )
 
-                for agent_id, bundle in enumerate(self.bundles):
-                    o, act, lp, vr, vc = store_batch[agent_id]
-                    bundle.buffer.store(
-                        obs=o,
-                        act=act,
-                        reward=rewards_t[:, agent_id].flatten(),
-                        cost=costs_t[:, agent_id].flatten(),
-                        value_r=vr,
-                        value_c=vc,
-                        log_prob=lp,
+                if self.share_policy and len(self.bundles) == 1:
+                    bundle = self.bundles[0]
+                    flat_obs = torch.cat([item[0] for item in store_batch], dim=0)
+                    flat_act = torch.cat([item[1] for item in store_batch], dim=0)
+                    flat_lp = torch.cat([item[2] for item in store_batch], dim=0)
+                    flat_vr = torch.cat([item[3] for item in store_batch], dim=0)
+                    flat_vc = torch.cat([item[4] for item in store_batch], dim=0)
+                    flat_rew = torch.cat(
+                        [rewards_t[:, a].flatten() for a in range(self.num_agents)], dim=0,
                     )
+                    flat_cost = torch.cat(
+                        [costs_t[:, a].flatten() for a in range(self.num_agents)], dim=0,
+                    )
+                    bundle.buffer.store(
+                        obs=flat_obs,
+                        act=flat_act,
+                        reward=flat_rew,
+                        cost=flat_cost,
+                        value_r=flat_vr,
+                        value_c=flat_vc,
+                        log_prob=flat_lp,
+                    )
+                else:
+                    for agent_id, bundle in enumerate(self.bundles):
+                        o, act, lp, vr, vc = store_batch[agent_id]
+                        bundle.buffer.store(
+                            obs=o,
+                            act=act,
+                            reward=rewards_t[:, agent_id].flatten(),
+                            cost=costs_t[:, agent_id].flatten(),
+                            value_r=vr,
+                            value_c=vc,
+                            log_prob=lp,
+                        )
 
                 obs = self._as_tensor(obs)
                 epoch_end = step >= local_steps - 1
@@ -670,14 +794,12 @@ class Runner:
             # independent PPO updates per agent (2nd update uses stale log_probs vs
             # already-updated weights → broken ratios / fake learning signal).
             if self.share_policy:
-                datas = [b.buffer.get() for b in self.bundles]
-                merged = _merge_buffer_data(datas)
                 iters, kl = _ppo_update_agent(
                     self.bundles[0],
                     self.ppo_cfg,
                     self.logger,
                     use_lagrange=self.use_lagrange,
-                    data=merged,
+                    num_agents=self.num_agents,
                 )
                 stop_iter, total_kl = iters, kl
             else:
@@ -749,12 +871,21 @@ class Runner:
 
         while completed < target:
             actions = []
-            for agent_id, bundle in enumerate(self.bundles):
-                with torch.no_grad():
-                    act, _, _, _ = bundle.policy.step(
-                        obs[:, agent_id], deterministic=deterministic
-                    )
-                actions.append(act)
+            if self.share_policy and len(self.bundles) == 1:
+                policy = self.bundles[0].policy
+                for agent_id in range(self.num_agents):
+                    with torch.no_grad():
+                        act, _, _, _ = policy.step(
+                            obs[:, agent_id], agent_id, deterministic=deterministic,
+                        )
+                    actions.append(act)
+            else:
+                for agent_id, bundle in enumerate(self.bundles):
+                    with torch.no_grad():
+                        act, _, _, _ = bundle.policy.step(
+                            obs[:, agent_id], deterministic=deterministic
+                        )
+                    actions.append(act)
             obs, _, rewards, costs, dones, _, _ = eval_env.step(actions)
             rewards_t = self._as_tensor(rewards)
             costs_t = self._as_tensor(costs)
