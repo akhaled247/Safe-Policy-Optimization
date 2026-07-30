@@ -101,19 +101,21 @@ def main(args, cfg_env=None):
         act_dim=act_space.shape[0],
         hidden_sizes=config["hidden_sizes"],
     ).to(device)
-    actor_optimizer = torch.optim.Adam(policy.actor.parameters(), lr=3e-4)
+    actor_lr = float(getattr(args, "actor_lr", 3e-4))
+    critic_lr = float(getattr(args, "critic_lr", 3e-4))
+    actor_optimizer = torch.optim.Adam(policy.actor.parameters(), lr=actor_lr)
+    end_factor = float(getattr(args, "lr_end_factor", 1.0))  # Default to no lr_end_factor
     actor_scheduler = LinearLR(
         actor_optimizer,
         start_factor=1.0,
-        end_factor=0.0,
-        total_iters=epochs,
-        verbose=False,
+        end_factor=end_factor,
+        total_iters=max(epochs, 1),
     )
     reward_critic_optimizer = torch.optim.Adam(
-        policy.reward_critic.parameters(), lr=3e-4
+        policy.reward_critic.parameters(), lr=critic_lr
     )
     cost_critic_optimizer = torch.optim.Adam(
-        policy.cost_critic.parameters(), lr=3e-4
+        policy.cost_critic.parameters(), lr=critic_lr
     )
 
     # create the vectorized on-policy buffer
@@ -124,6 +126,8 @@ def main(args, cfg_env=None):
         device=device,
         num_envs=args.num_envs,
         gamma=config["gamma"],
+        lam=float(getattr(args, "lam", 0.95)),
+        lam_c=float(getattr(args, "lam_c", 0.95)),
     )
     # setup lagrangian multiplier
     lagrange = Lagrange(
@@ -314,13 +318,20 @@ def main(args, cfg_env=None):
                         loss_c += param.pow(2).sum() * 0.001
                 distribution = policy.actor(obs_b)
                 log_prob = distribution.log_prob(act_b).sum(dim=-1)
+                # Sum over action dims to match log_prob; Normal.entropy() is per-dim.
+                entropy = distribution.entropy().sum(dim=-1).mean()
+                ent_coef = float(getattr(args, "ent_coef", 0.0))
                 ratio = torch.exp(log_prob - log_prob_b)
-                ratio_cliped = torch.clamp(ratio, 0.8, 1.2)
+                clip = float(getattr(args, "clip_ratio", 0.2))
+                ratio_cliped = torch.clamp(ratio, 1.0 - clip, 1.0 + clip)
                 loss_pi = -torch.min(ratio * adv_b, ratio_cliped * adv_b).mean()
+                loss_pi = loss_pi - ent_coef * entropy  # maximize H when minimizing loss
                 actor_optimizer.zero_grad()
-                total_loss = loss_pi + 2*loss_r + loss_c \
-                    if config.get("use_value_coefficient", False) \
+                total_loss = (
+                    loss_pi + 2 * loss_r + loss_c
+                    if config.get("use_value_coefficient", False)
                     else loss_pi + loss_r + loss_c
+                )
                 total_loss.backward()
                 clip_grad_norm_(policy.parameters(), config["max_grad_norm"])
                 reward_critic_optimizer.step()
@@ -332,6 +343,7 @@ def main(args, cfg_env=None):
                         "Loss/Loss_reward_critic": loss_r.mean().item(),
                         "Loss/Loss_cost_critic": loss_c.mean().item(),
                         "Loss/Loss_actor": loss_pi.mean().item(),
+                        "Misc/Entropy": entropy.item(),
                     }
                 )
 
@@ -375,7 +387,8 @@ def main(args, cfg_env=None):
             logger.log_tabular("Value/CostAdv", data["adv_c"].mean().item())
 
             logger.dump_tabular()
-            if (epoch+1) % 100 == 0 or epoch == 0:
+            save_freq = int(getattr(args, "save_model_freq", 10))  # epochs
+            if epoch == 0 or epoch == epochs - 1 or (epoch + 1) % save_freq == 0:
                 logger.torch_save(itr=epoch)
                 if args.task not in isaac_gym_map.keys():
                     logger.save_state(
@@ -384,6 +397,15 @@ def main(args, cfg_env=None):
                         },
                         itr = epoch
                     )
+    # Belt-and-suspenders: always write final epoch after the training loop
+    last_epoch = epochs - 1
+    if last_epoch >= 0:
+        logger.torch_save(itr=last_epoch)
+        if args.task not in isaac_gym_map.keys():
+            logger.save_state(
+                state_dict={"Normalizer": env.obs_rms},
+                itr=last_epoch,
+            )
     logger.close()
 
 

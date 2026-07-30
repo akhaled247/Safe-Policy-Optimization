@@ -82,27 +82,11 @@ class Actor(nn.Module):
 
 
 class VCritic(nn.Module):
-    """
-    Critic network for value-based reinforcement learning.
-
-    This class represents a critic network that estimates the value function for input observations.
-
-    Args:
-        obs_dim (int): Dimensionality of the observation space.
-
-    Attributes:
-        critic (nn.Sequential): MLP network representing the critic function.
-
-    Example:
-        obs_dim = 10
-        critic = VCritic(obs_dim)
-        observation = torch.randn(1, obs_dim)
-        value_estimate = critic(observation)
-    """
+    """Critic network for value-based reinforcement learning."""
 
     def __init__(self, obs_dim, hidden_sizes: list = [64, 64]):
         super().__init__()
-        self.critic = build_mlp_network([obs_dim]+hidden_sizes+[1])
+        self.critic = build_mlp_network([obs_dim] + hidden_sizes + [1])
 
     def forward(self, obs):
         return torch.squeeze(self.critic(obs), -1)
@@ -168,6 +152,59 @@ class ActorVCritic(nn.Module):
         value_r = self.reward_critic(obs)
         value_c = self.cost_critic(obs)
         return action, log_prob, value_r, value_c
+
+
+class SharedActorLocalCritic(nn.Module):
+    """Shared actor with per-agent reward/cost critics (IPPO share_policy=True)."""
+
+    def __init__(
+        self,
+        obs_dim: int,
+        act_dim: int,
+        num_agents: int,
+        hidden_sizes: list | None = None,
+    ):
+        super().__init__()
+        hidden_sizes = hidden_sizes or [64, 64]
+        self.num_agents = num_agents
+        self.actor = Actor(obs_dim, act_dim, hidden_sizes)
+        self.reward_critics = nn.ModuleList(
+            [VCritic(obs_dim, hidden_sizes) for _ in range(num_agents)]
+        )
+        self.cost_critics = nn.ModuleList(
+            [VCritic(obs_dim, hidden_sizes) for _ in range(num_agents)]
+        )
+
+    def _values_for_agents(
+        self,
+        obs: torch.Tensor,
+        agent_ids: torch.Tensor,
+        critics: nn.ModuleList,
+    ) -> torch.Tensor:
+        values = torch.empty(obs.shape[0], device=obs.device, dtype=obs.dtype)
+        for aid in range(self.num_agents):
+            mask = agent_ids == aid
+            if mask.any():
+                values[mask] = critics[aid](obs[mask])
+        return values
+
+    def reward_values(self, obs: torch.Tensor, agent_ids: torch.Tensor) -> torch.Tensor:
+        return self._values_for_agents(obs, agent_ids, self.reward_critics)
+
+    def cost_values(self, obs: torch.Tensor, agent_ids: torch.Tensor) -> torch.Tensor:
+        return self._values_for_agents(obs, agent_ids, self.cost_critics)
+
+    def step(self, obs, agent_id: int, deterministic: bool = False):
+        dist = self.actor(obs)
+        if deterministic:
+            action = dist.mean
+        else:
+            action = dist.rsample()
+        log_prob = dist.log_prob(action).sum(axis=-1)
+        value_r = self.reward_critics[agent_id](obs)
+        value_c = self.cost_critics[agent_id](obs)
+        return action, log_prob, value_r, value_c
+
 
 class MultiAgentActor(nn.Module):
     """
@@ -308,7 +345,7 @@ class MultiAgentCritic(nn.Module):
     Args:
         config (dict): Configuration dictionary.
         cent_obs_space (gym.spaces.Space): Centralized observation space.
-        device (torch.device): Device to use for computations (default: cuda:0).
+        device (torch.device): Device to use for computations (default: cuda:1).
 
     Attributes:
         hidden_size (int): Size of the hidden layer.
@@ -319,7 +356,7 @@ class MultiAgentCritic(nn.Module):
         tpdv (dict): Dictionary for tensor properties.
     """
     
-    def __init__(self, config, cent_obs_space, device=torch.device("cuda:0")):
+    def __init__(self, config, cent_obs_space, device=torch.device("cuda:1")):
         super(MultiAgentCritic, self).__init__()
         self.hidden_size = config["hidden_size"]
         self._use_orthogonal = config["use_orthogonal"]

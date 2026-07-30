@@ -195,12 +195,15 @@ def main(args, cfg_env=None):
         act_dim=act_space.shape[0],
         hidden_sizes=config["hidden_sizes"],
     ).to(device)
+    critic_lr = float(getattr(args, "critic_lr", 3e-4))
+
     reward_critic_optimizer = torch.optim.Adam(
-        policy.reward_critic.parameters(), lr=1e-3
+        policy.reward_critic.parameters(), lr=critic_lr
     )
     cost_critic_optimizer = torch.optim.Adam(
-        policy.cost_critic.parameters(), lr=1e-3
+        policy.cost_critic.parameters(), lr=critic_lr
     )
+
 
     # create the vectorized on-policy buffer
     buffer = VectorizedOnPolicyBuffer(
@@ -210,6 +213,8 @@ def main(args, cfg_env=None):
         device=device,
         num_envs=args.num_envs,
         gamma=config["gamma"],
+        lam=float(getattr(args, "lam", 0.95)),
+        lam_c=float(getattr(args, "lam_c", 0.95)),
     )
 
     # set up the logger
@@ -364,7 +369,9 @@ def main(args, cfg_env=None):
         temp_distribution = policy.actor(data["obs"])
         log_prob = temp_distribution.log_prob(data["act"]).sum(dim=-1)
         ratio = torch.exp(log_prob - data["log_prob"])
-        loss_pi = -(ratio * advantage).mean()
+        ent_coef = float(getattr(args, "ent_coef", 0.0))
+        entropy = temp_distribution.entropy().sum(dim=-1).mean()
+        loss_pi = -(ratio * advantage).mean() - ent_coef * entropy
         loss_before = loss_pi.item()
         old_distribution = policy.actor(data["obs"])
 
@@ -396,7 +403,8 @@ def main(args, cfg_env=None):
                 temp_distribution = policy.actor(data["obs"])
                 log_prob = temp_distribution.log_prob(data["act"]).sum(dim=-1)
                 ratio = torch.exp(log_prob - data["log_prob"])
-                loss_pi = -(ratio * advantage).mean()
+                entropy = temp_distribution.entropy().sum(dim=-1).mean()
+                loss_pi = -(ratio * advantage).mean() - ent_coef * entropy
                 # compute KL distance between new and old policy
                 current_distribution = policy.actor(data["obs"])
                 kl = (
@@ -441,6 +449,7 @@ def main(args, cfg_env=None):
                 "Misc/H_inv_g": x.norm().item(),
                 "Misc/AcceptanceStep": acceptance_step,
                 "Loss/Loss_actor": loss_pi.mean().item(),
+                "Misc/Entropy": entropy.item(),
                 "Train/KL": final_kl,
             },
         )
@@ -514,7 +523,8 @@ def main(args, cfg_env=None):
             logger.log_tabular("Misc/AcceptanceStep")
 
             logger.dump_tabular()
-            if (epoch+1) % 100 == 0 or epoch == 0:
+            save_freq = int(getattr(args, "save_model_freq", 10))  # epochs
+            if epoch == 0 or epoch == epochs - 1 or (epoch + 1) % save_freq == 0:
                 logger.torch_save(itr=epoch)
                 if args.task not in isaac_gym_map.keys():
                     logger.save_state(
@@ -523,6 +533,15 @@ def main(args, cfg_env=None):
                         },
                         itr = epoch
                     )
+    # Belt-and-suspenders: always write final epoch after the training loop
+    last_epoch = epochs - 1
+    if last_epoch >= 0:
+        logger.torch_save(itr=last_epoch)
+        if args.task not in isaac_gym_map.keys():
+            logger.save_state(
+                state_dict={"Normalizer": env.obs_rms},
+                itr=last_epoch,
+            )
     logger.close()
 
 

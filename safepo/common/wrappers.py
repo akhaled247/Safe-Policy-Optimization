@@ -16,8 +16,14 @@
 
 from __future__ import annotations
 
+import sys
+
+from safepo.common.farama_filter import silence_farama_adroit_spam
+
+# Spawn workers re-import this module; silence before safety_gymnasium import.
+silence_farama_adroit_spam()
+
 from abc import ABC, abstractmethod
-from multiprocessing import Pipe, Process
 
 from typing import Any
 import torch
@@ -260,9 +266,9 @@ class CloudpickleWrapper:
         return cloudpickle.dumps(self.x)
 
     def __setstate__(self, ob):
-        import pickle
+        import cloudpickle
 
-        self.x = pickle.loads(ob)
+        self.x = cloudpickle.loads(ob)
 
 
 class ShareVecEnv(ABC):
@@ -392,18 +398,49 @@ class ShareVecEnv(ABC):
 
 
 
+def _stash_final_obs_in_infos(ob, s_ob, info):
+    """Copy pre-reset obs into per-agent infos (SA vector-env final_observation pattern)."""
+    if not isinstance(info, (list, tuple)):
+        return info
+    for i, agent_info in enumerate(info):
+        if not isinstance(agent_info, dict):
+            continue
+        if isinstance(ob, (list, tuple)) and i < len(ob):
+            agent_info["final_observation"] = np.asarray(ob[i], dtype=np.float32).copy()
+        if isinstance(s_ob, (list, tuple)) and i < len(s_ob):
+            agent_info["final_share_observation"] = np.asarray(s_ob[i], dtype=np.float32).copy()
+        elif s_ob is not None and not isinstance(s_ob, (list, tuple)):
+            agent_info["final_share_observation"] = np.asarray(s_ob, dtype=np.float32).copy()
+    return info
+
+
 def shareworker(remote, parent_remote, env_fn_wrapper):
     parent_remote.close()
-    env = env_fn_wrapper.x()
+    try:
+        env = env_fn_wrapper.x()
+    except BaseException:
+        import traceback
+
+        try:
+            remote.send(("init_error", traceback.format_exc()))
+        except Exception:
+            pass
+        raise
+    remote.send(("ready", None))
     while True:
         cmd, data = remote.recv()
         if cmd == 'step':
+            # IPC payloads are CPU tensors/numpy — never CUDA across processes.
+            if torch.is_tensor(data):
+                data = data.detach().cpu()
             ob, s_ob, reward, cost, done, info, available_actions = env.step(data)
             if 'bool' in done.__class__.__name__:
                 if done:
+                    info = _stash_final_obs_in_infos(ob, s_ob, info)
                     ob, s_ob, available_actions = env.reset()
             else:
                 if np.all(done):
+                    info = _stash_final_obs_in_infos(ob, s_ob, info)
                     ob, s_ob, available_actions = env.reset()
 
             remote.send((ob, s_ob, reward, cost, done, info, available_actions))
@@ -429,9 +466,47 @@ def shareworker(remote, parent_remote, env_fn_wrapper):
             fr = env.render_vulnerability(data)
             remote.send(fr)
         elif cmd == 'get_num_agents':
-            remote.send(env.num_agents)
+            remote.send(env.unwrapped.num_agents)
         else:
             raise NotImplementedError
+
+
+def _ensure_spawn_start_method() -> None:
+    """Prefer spawn when start method still unset (CUDA + fork is unsafe)."""
+    import multiprocessing as mp
+
+    if mp.get_start_method(allow_none=True) is not None:
+        return
+    try:
+        mp.set_start_method("spawn")
+    except RuntimeError:
+        pass
+
+
+def _stack_ma_agent_batch(batch, device):
+    """(n_envs, n_agents, dim) tensor from zip(*worker_results) obs/share_obs payloads."""
+    if isinstance(batch, tuple):
+        batch = list(batch)
+    if not batch:
+        raise ValueError("empty multi-agent batch")
+    first = batch[0]
+    if isinstance(first, (list, tuple)):
+        arr = np.stack([np.stack(env_items) for env_items in batch], axis=0)
+    else:
+        arr = np.stack(batch, axis=0)[np.newaxis, ...]
+    return torch.tensor(arr, dtype=torch.float32, device=device)
+
+
+def _stack_ma_scalar_batch(batch, device):
+    """Stack per-env agent scalars/lists (rewards, costs, dones) to (n_envs, n_agents, ...)."""
+    if isinstance(batch, tuple):
+        batch = list(batch)
+    first = batch[0]
+    if isinstance(first, (list, tuple)):
+        arr = np.stack([np.asarray(env_items) for env_items in batch], axis=0)
+    else:
+        arr = np.asarray(batch)[np.newaxis, ...]
+    return torch.tensor(arr, dtype=torch.float32, device=device)
 
 
 class ShareSubprocVecEnv(ShareVecEnv):
@@ -440,9 +515,11 @@ class ShareSubprocVecEnv(ShareVecEnv):
         self.closed = False
         self.device = device
         nenvs = len(env_fns)
-        self.remotes, self.work_remotes = zip(*[Pipe() for _ in range(nenvs)])
+        _ensure_spawn_start_method()
+        ctx = torch.multiprocessing.get_context("spawn")
+        self.remotes, self.work_remotes = zip(*[ctx.Pipe() for _ in range(nenvs)])
         self.ps = [
-            Process(target=shareworker, args=(work_remote, remote, CloudpickleWrapper(env_fn)))
+            ctx.Process(target=shareworker, args=(work_remote, remote, CloudpickleWrapper(env_fn)))
             for (work_remote, remote, env_fn) in zip(self.work_remotes, self.remotes, env_fns)
         ]
         for p in self.ps:
@@ -450,6 +527,19 @@ class ShareSubprocVecEnv(ShareVecEnv):
             p.start()
         for remote in self.work_remotes:
             remote.close()
+        for i, remote in enumerate(self.remotes):
+            try:
+                msg = remote.recv()
+            except EOFError as exc:
+                exit_codes = [p.exitcode for p in self.ps]
+                raise RuntimeError(
+                    f"Subproc env worker {i} died during init (exit codes={exit_codes}). "
+                    "Re-run with --num-envs 1 to surface the traceback, or check stderr."
+                ) from exc
+            if isinstance(msg, tuple) and msg[0] == "init_error":
+                for p in self.ps:
+                    p.join(timeout=1)
+                raise RuntimeError(f"Subproc env worker {i} failed during init:\n{msg[1]}")
         self.remotes[0].send(('get_num_agents', None))
         self.num_agents = self.remotes[0].recv()
         self.remotes[0].send(('get_spaces', None))
@@ -460,6 +550,8 @@ class ShareSubprocVecEnv(ShareVecEnv):
 
     def step_async(self, actions):
         env_actions = torch.transpose(torch.stack(actions), 1, 0)
+        # Never pickle CUDA tensors into workers.
+        env_actions = env_actions.detach().cpu()
         for remote, action in zip(self.remotes, env_actions):
             remote.send(('step', action))
         self.waiting = True
@@ -468,18 +560,22 @@ class ShareSubprocVecEnv(ShareVecEnv):
         results = [remote.recv() for remote in self.remotes]
         self.waiting = False
         obs, share_obs, rews, costs, dones, infos, available_actions = zip(*results)
-        obs, share_obs, rews, costs, dones, available_actions = map(
-            lambda x: torch.tensor(np.stack(x), device=self.device), (obs, share_obs, rews, costs, dones, available_actions)
-        )
+        obs = _stack_ma_agent_batch(obs, self.device)
+        share_obs = _stack_ma_agent_batch(share_obs, self.device)
+        rews = _stack_ma_scalar_batch(rews, self.device)
+        costs = _stack_ma_scalar_batch(costs, self.device)
+        dones = _stack_ma_scalar_batch(dones, self.device)
+        available_actions = torch.tensor(np.stack(available_actions), dtype=torch.float32, device=self.device)
         return obs, share_obs, rews, costs, dones, infos, available_actions
 
     def reset(self):
         for remote in self.remotes:
             remote.send(('reset', None))
         results = [remote.recv() for remote in self.remotes]
-        obs, share_obs, available_actions = map(
-            lambda x: torch.tensor(np.stack(x), device=self.device), zip(*results)
-        )
+        obs, share_obs, available_actions = zip(*results)
+        obs = _stack_ma_agent_batch(obs, self.device)
+        share_obs = _stack_ma_agent_batch(share_obs, self.device)
+        available_actions = torch.tensor(np.stack(available_actions), dtype=torch.float32, device=self.device)
         return obs, share_obs, available_actions
 
     
@@ -489,7 +585,7 @@ class ShareDummyVecEnv(ShareVecEnv):
         self.envs = [fn() for fn in env_fns]
         env = self.envs[0]
         self.device = device
-        self.num_agents=env.num_agents
+        self.num_agents=env.unwrapped.num_agents
         ShareVecEnv.__init__(
             self, len(env_fns), env.observation_spaces, env.share_observation_spaces, env.action_spaces
         )
@@ -497,28 +593,42 @@ class ShareDummyVecEnv(ShareVecEnv):
 
     def step_async(self, actions):
         env_actions = torch.transpose(torch.stack(actions), 1, 0)
-        self.actions = env_actions
+        # Keep actions on CPU for env.step (avoids accidental CUDA tensors).
+        self.actions = env_actions.detach().cpu()
 
     def step_wait(self):
         results = [env.step(a) for (a, env) in zip(self.actions, self.envs)]
-        obs, share_obs, rews, cos, dones, infos, available_actions = map(np.array, zip(*results))
+        obs, share_obs, rews, cos, dones, infos, available_actions = zip(*results)
+        # infos stays as tuple of per-env info lists (do not np.array — ragged dicts)
+        infos = list(infos)
+        obs = list(obs)
+        share_obs = list(share_obs)
+        available_actions = list(available_actions)
+        dones = list(dones)
 
         for i, done in enumerate(dones):
             if np.all(done):
+                infos[i] = _stash_final_obs_in_infos(obs[i], share_obs[i], infos[i])
                 obs[i], share_obs[i], available_actions[i] = self.envs[i].reset()
         self.actions = None
 
-        obs, share_obs, rews, cos, dones, available_actions = map(
-            lambda x: torch.tensor(x).to(self.device), (obs, share_obs, rews, cos, dones, available_actions)
+        obs = _stack_ma_agent_batch(obs, self.device)
+        share_obs = _stack_ma_agent_batch(share_obs, self.device)
+        rews = _stack_ma_scalar_batch(rews, self.device)
+        cos = _stack_ma_scalar_batch(cos, self.device)
+        dones = _stack_ma_scalar_batch(dones, self.device)
+        available_actions = torch.tensor(
+            np.stack(available_actions), dtype=torch.float32, device=self.device
         )
 
         return obs, share_obs, rews, cos, dones, infos, available_actions
 
     def reset(self):
         results = [env.reset() for env in self.envs]
-        obs, share_obs, available_actions = map(
-            lambda x: torch.tensor(np.stack(x), device=self.device), zip(*results)
-        )
+        obs, share_obs, available_actions = zip(*results)
+        obs = _stack_ma_agent_batch(obs, self.device)
+        share_obs = _stack_ma_agent_batch(share_obs, self.device)
+        available_actions = torch.tensor(np.stack(available_actions), dtype=torch.float32, device=self.device)
         return obs, share_obs, available_actions
 
     def render(self):

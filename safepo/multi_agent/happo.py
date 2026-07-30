@@ -31,6 +31,10 @@ from safepo.common.popart import PopArt
 from safepo.common.model import MultiAgentActor as Actor, MultiAgentCritic as Critic
 from safepo.common.buffer import SeparatedReplayBuffer
 from safepo.common.logger import EpochLogger
+from safepo.multi_agent.ma_episode_metrics import (
+    make_metric_deques,
+    record_sa_style_episode_metrics,
+)
 from safepo.utils.config import multi_agent_args, parse_sim_params, set_np_formatting, set_seed, multi_agent_velocity_map, isaac_gym_map, multi_agent_goal_tasks
 
 
@@ -264,12 +268,12 @@ class Runner:
 
         train_episode_rewards = torch.zeros(1, self.config["n_rollout_threads"], device=self.config["device"])
         train_episode_costs = torch.zeros(1, self.config["n_rollout_threads"], device=self.config["device"])
+        train_episode_lens = torch.zeros(1, self.config["n_rollout_threads"], device=self.config["device"])
+        rew_deque, cost_deque, len_deque = make_metric_deques()
         eval_rewards=0.0
         eval_costs=0.0
+        eval_lens=0.0
         for episode in range(episodes):
-
-            done_episodes_rewards = []
-            done_episodes_costs = []
 
             for step in range(self.config["episode_length"]):
                 # Sample actions
@@ -283,13 +287,22 @@ class Runner:
 
                 train_episode_rewards += reward_env
                 train_episode_costs += cost_env
+                train_episode_lens += 1
 
                 for t in range(self.config["n_rollout_threads"]):
                     if dones_env[t]:
-                        done_episodes_rewards.append(train_episode_rewards[:, t].clone())
+                        record_sa_style_episode_metrics(
+                            self.logger,
+                            rew_deque,
+                            cost_deque,
+                            len_deque,
+                            float(train_episode_rewards[:, t].item()),
+                            float(train_episode_costs[:, t].item()),
+                            float(train_episode_lens[:, t].item()),
+                        )
                         train_episode_rewards[:, t] = 0
-                        done_episodes_costs.append(train_episode_costs[:, t].clone())
                         train_episode_costs[:, t] = 0
+                        train_episode_lens[:, t] = 0
 
                 data = obs, share_obs, rewards, dones, infos, \
                        values, actions, action_log_probs, \
@@ -307,25 +320,24 @@ class Runner:
             end = time.time()
             
             if episode % self.config["eval_interval"] == 0 and self.config["use_eval"]:
-                eval_rewards, eval_costs = self.eval()
+                eval_rewards, eval_costs, eval_lens = self.eval()
 
-            if len(done_episodes_rewards) != 0:
-                aver_episode_rewards = torch.stack(done_episodes_rewards).mean()
-                aver_episode_costs = torch.stack(done_episodes_costs).mean()
-                self.return_aver_cost(aver_episode_costs)
+            if len(len_deque) != 0:
+                self.return_aver_cost(torch.tensor(float(np.mean(cost_deque)), device=self.config["device"]))
                 self.logger.store(
                     **{
-                        "Metrics/EpRet": aver_episode_rewards.item(),
-                        "Metrics/EpCost": aver_episode_costs.item(),
                         "Eval/EpRet": eval_rewards,
                         "Eval/EpCost": eval_costs,
+                        "Eval/EpLen": eval_lens,
                     }
                 )
                 
                 self.logger.log_tabular("Metrics/EpRet", min_and_max=True, std=True)
                 self.logger.log_tabular("Metrics/EpCost", min_and_max=True, std=True)
+                self.logger.log_tabular("Metrics/EpLen", min_and_max=True, std=True)
                 self.logger.log_tabular("Eval/EpRet")
                 self.logger.log_tabular("Eval/EpCost")
+                self.logger.log_tabular("Eval/EpLen")
                 self.logger.log_tabular("Train/Epoch", episode)
                 self.logger.log_tabular("Train/TotalSteps", total_num_steps)
                 self.logger.log_tabular("Loss/Loss_reward_critic")
@@ -463,8 +475,10 @@ class Runner:
         eval_episode = 0
         eval_episode_rewards = []
         eval_episode_costs = []
+        eval_episode_lens = []
         one_episode_rewards = torch.zeros(1, self.config["n_eval_rollout_threads"], device=self.config["device"])
         one_episode_costs = torch.zeros(1, self.config["n_eval_rollout_threads"], device=self.config["device"])
+        one_episode_lens = torch.zeros(1, self.config["n_eval_rollout_threads"], device=self.config["device"])
 
         eval_obs, _, _ = self.eval_envs.reset()
 
@@ -502,6 +516,7 @@ class Runner:
 
             one_episode_rewards += reward_env
             one_episode_costs += cost_env
+            one_episode_lens += 1
 
             eval_dones_env = torch.all(eval_dones, dim=1)
 
@@ -519,9 +534,11 @@ class Runner:
                     one_episode_rewards[:, eval_i] = 0
                     eval_episode_costs.append(one_episode_costs[:, eval_i].mean().item())
                     one_episode_costs[:, eval_i] = 0
+                    eval_episode_lens.append(one_episode_lens[:, eval_i].item())
+                    one_episode_lens[:, eval_i] = 0
 
             if eval_episode >= eval_episodes:
-                return np.mean(eval_episode_rewards), np.mean(eval_episode_costs)
+                return np.mean(eval_episode_rewards), np.mean(eval_episode_costs), np.mean(eval_episode_lens)
 
     @torch.no_grad()
     def compute(self):
@@ -560,10 +577,14 @@ def train(args, cfg_train):
         eval_env = env
     elif args.task in multi_agent_goal_tasks:
         env = make_ma_multi_goal_env(task=args.task, seed=args.seed, cfg_train=cfg_train)
-        cfg_eval = copy.deepcopy(cfg_train)
-        cfg_eval["seed"] = args.seed + 10000
-        cfg_eval["n_rollout_threads"] = cfg_eval["n_eval_rollout_threads"]
-        eval_env = make_ma_multi_goal_env(task=args.task, seed=args.seed + 10000, cfg_train=cfg_eval)
+        # Skip second ShareSubprocVecEnv when eval unused (spawn workers re-import → Farama spam).
+        if cfg_train.get("use_eval") or getattr(args, "model_dir", ""):
+            cfg_eval = copy.deepcopy(cfg_train)
+            cfg_eval["seed"] = args.seed + 10000
+            cfg_eval["n_rollout_threads"] = cfg_eval["n_eval_rollout_threads"]
+            eval_env = make_ma_multi_goal_env(task=args.task, seed=args.seed + 10000, cfg_train=cfg_eval)
+        else:
+            eval_env = None
     else: 
         raise NotImplementedError
     
